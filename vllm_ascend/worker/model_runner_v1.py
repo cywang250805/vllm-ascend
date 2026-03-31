@@ -809,16 +809,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_tokens if i == self.dp_rank else 0 for i in range(self.dp_size)
         ],
                                          dtype=torch.int32,
-                                         device="npu")
+                                         device="cpu")
 
         flags_tensor = torch.tensor(
             [int(with_prefill), int(not enable_dbo)],
             dtype=torch.int32,
-            device="npu")
+            device="cpu")
 
         packed_tensor = torch.cat([num_tokens_tensor, flags_tensor])
-
-        dist.all_reduce(packed_tensor, group=get_dp_group().device_group)
+ 
+        dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[:-2]
@@ -1923,6 +1923,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                            uniform_decode=uniform_decode)
         aclgraph_runtime_mode, batch_descriptor = \
             self.aclgraph_dispatcher.dispatch(batch_descriptor)
+        
+        if self.with_prefill:
+            aclgraph_runtime_mode = CUDAGraphMode.NONE
 
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
@@ -2450,7 +2453,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     f"Aclgraph runtime mode mismatch at dummy_run. "
                     f"Expected {_ag_mode}, but got {aclgraph_runtime_mode}.")
             else:
-                aclgraph_runtime_mode = _ag_mode
+                if not self.in_profile_run and with_prefill:
+                    aclgraph_runtime_mode = CUDAGraphMode.NONE
+                else: 
+                    aclgraph_runtime_mode = _ag_mode
 
             # TODO(Mengqing): Set create_mixed_batch to False since it's only used in FI warmup
             # and not supported in ASCEND now. We could remove it in the future.

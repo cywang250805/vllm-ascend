@@ -111,6 +111,9 @@ class NPUWorker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
+        
+        self.local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        self.global_rank = self.local_dp_rank*self.vllm_config.parallel_config.world_size + self.local_rank
 
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
@@ -216,6 +219,7 @@ class NPUWorker(WorkerBase):
         # Init ModelRunner here, so that we have access to self.device.
         self.model_runner = NPUModelRunner(self.vllm_config, device)
 
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
