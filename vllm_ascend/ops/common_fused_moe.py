@@ -65,7 +65,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             self.use_aclgraph = (vllm_config.compilation_config.level
                                  == CompilationLevel.PIECEWISE and
                                  not vllm_config.model_config.enforce_eager)
-        self.transpose = True
+        self.transpose = False
 
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod,
@@ -73,21 +73,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if self.transpose:
             w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(
                 1, 2).contiguous()
-            layer.w13_weight = torch.nn.Parameter(w13_data,
-                                                  requires_grad=False)
+            layer.w13_weight.data = w13_data
 
             w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(
                 1, 2).contiguous()
-            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+            layer.w2_weight.data = w2_data
 
-            self.transpose = False
+            #self.transpose = False
         else:
             w13_data = self._maybe_pad_weight(layer.w13_weight.data)
-            layer.w13_weight = torch.nn.Parameter(w13_data,
-                                                  requires_grad=False)
+            layer.w13_weight.data=w13_data
 
             w2_data = self._maybe_pad_weight(layer.w2_weight.data)
-            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+            layer.w2_weight.data=w2_data
 
         if not is_310p() and is_enable_nz():
             layer.w13_weight.data = torch_npu.npu_format_cast(
@@ -133,7 +131,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance and not self.use_aclgraph:
+        if enable_force_load_balance:
             topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
 
         moe_comm_method = get_forward_context().moe_comm_method

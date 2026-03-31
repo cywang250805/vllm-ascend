@@ -108,7 +108,7 @@ class MoECommMethod(ABC):
             # For load balance
             log2phy: torch.Tensor = None,
             global_redundant_expert_num: int = 0,
-            need_trans: bool = False,
+            need_trans: bool = True,
             dynamic_eplb: bool = False):
         # Check constraints
         assert hidden_states.dtype in [

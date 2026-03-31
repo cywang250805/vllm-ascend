@@ -175,6 +175,7 @@ class NPUWorker(WorkerBase):
             used_bytes / GiB_bytes)
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
+        self.model_runner.count = 0
         if not sleep_mode_enabled():
             raise ValueError(
                 "Sleep mode is not enabled. Please compile vllm-ascend with COMPILE_CUSTOM_KERNELS=1."
@@ -216,6 +217,7 @@ class NPUWorker(WorkerBase):
         # Init ModelRunner here, so that we have access to self.device.
         self.model_runner = NPUModelRunner(self.vllm_config, device)
 
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
