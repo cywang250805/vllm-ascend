@@ -112,6 +112,9 @@ class NPUWorker(WorkerBase):
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
 
+        self.local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        self.global_rank = self.local_dp_rank*self.vllm_config.parallel_config.world_size + self.local_rank
+
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
             try:
