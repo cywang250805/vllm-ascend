@@ -20,6 +20,7 @@ import dataclasses
 import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional, Tuple, Union
+import gc
 
 import torch
 from acl.rt import memcpy  # type: ignore # noqa: F401
@@ -208,6 +209,8 @@ class CaMemAllocator:
                        ACL_MEMCPY_DEVICE_TO_HOST)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+        gc.collect()
+        torch.npu.empty_cache()
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         """

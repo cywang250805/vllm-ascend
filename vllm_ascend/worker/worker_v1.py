@@ -175,6 +175,7 @@ class NPUWorker(WorkerBase):
             used_bytes / GiB_bytes)
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
+        # self.model_runner.count = 0, should used in memory optimization
         self.model_runner.count = 0
         if not sleep_mode_enabled():
             raise ValueError(
