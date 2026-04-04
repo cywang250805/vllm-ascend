@@ -294,6 +294,18 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
             "up_proj",
         ],
     },
+    "step3p5": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+        "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
 }
 
 
@@ -477,6 +489,9 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     def quant_prefix_mapper(self, model_type: str, prefix: str) -> str:
         # TODO (Levi-JQ): will be removed when QuantizationConfig.apply_vllm_mapper is implemented
+        if model_type == "step3p5":
+            prefix = prefix.replace(".moe.share_expert", ".share_expert")
+            prefix = prefix.replace(".mtp_block.", ".")
         prefix_mapping = QUANT_MODEL_PREFIX_MAPPINGS.get(model_type)
         if prefix_mapping:
             hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix=prefix_mapping)

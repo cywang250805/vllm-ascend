@@ -503,8 +503,8 @@ class CpuAlloc:
 
 
 def bind_cpus(rank_id: int) -> None:
-    if not is_arm_cpu():
-        logger.info("CPU binding skipped: non-ARM CPU detected.")
-        return
+    # if not is_arm_cpu():
+    #     logger.info("CPU binding skipped: non-ARM CPU detected.")
+    #     return
     binder = CpuAlloc(rank_id)
     binder.run_all()

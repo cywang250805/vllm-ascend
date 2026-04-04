@@ -111,7 +111,7 @@ def rejection_sample(
     assert target_logits.shape == (num_tokens, vocab_size)
 
     # When num_speculative_tokens>=3, using block verify.
-    using_block_verify = max_spec_len >= 3
+    using_block_verify = False #max_spec_len >= 3
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -125,12 +125,14 @@ def rejection_sample(
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
-    if HAS_TRITON:
+    # if HAS_TRITON:
+    if False:
         grid, block_size = cal_grid_and_block_size(batch_size)
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_logits.argmax(dim=-1)
-        if HAS_TRITON:
+        # if HAS_TRITON:
+        if False:
             rejection_greedy_sample_with_triton(
                 output_token_ids,
                 num_draft_tokens,
@@ -192,7 +194,8 @@ def rejection_sample(
     )
     if not using_block_verify:
         # Rejection sampling for random sampling requests.
-        if HAS_TRITON:
+        # if HAS_TRITON:
+        if False:
             rejection_random_sample_kernel[(grid,)](
                 output_token_ids,
                 cu_num_draft_tokens,
@@ -227,7 +230,8 @@ def rejection_sample(
             )
     else:
         # MagicMTP: Improving acceptance rate with Block Verify.
-        if HAS_TRITON:
+        # if HAS_TRITON:
+        if False:
             rejection_random_sample_block_verify_kernel[(grid,)](
                 output_token_ids,
                 cu_num_draft_tokens,
@@ -291,7 +295,8 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
-    if HAS_TRITON:
+    # if HAS_TRITON:
+    if False:
         expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replace_to, max_num_tokens=MAX_SPEC_LEN)
     else:
         expand_pytorch(
@@ -334,7 +339,8 @@ def sample_recovered_tokens(
         q[i] = torch.where(has_draft_mask[i], temp_q, q[i])
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    if HAS_TRITON:
+    # if HAS_TRITON:
+    if False:
         sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
             recovered_token_ids,
             cu_num_draft_tokens,
