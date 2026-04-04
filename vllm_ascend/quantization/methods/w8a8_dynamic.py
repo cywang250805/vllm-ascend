@@ -182,6 +182,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         log2phy: torch.Tensor | None = None,
         global_redundant_expert_num: int = 0,
         pertoken_scale: Any | None = None,
+        activation: str = "silu",
         **kwargs,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
@@ -262,6 +263,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             log2phy=log2phy,
             dynamic_eplb=self.dynamic_eplb,
             mc2_mask=kwargs.get("mc2_mask"),
+            activation=activation,
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
