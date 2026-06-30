@@ -151,6 +151,7 @@ checkout_src() {
     cd "$WORKSPACE"
     pip uninstall -y vllm-ascend || true
     cp -r "$WORKSPACE/vllm-ascend/benchmark" /tmp/aisbench-backup || true
+    cp /vllm-workspace/vllm-ascend/vllm_ascend/_build_info.py /tmp/_build_info_backup.py 2>/dev/null || true
     rm -rf "$WORKSPACE/vllm-ascend"
 
     if [ ! -d "$WORKSPACE/vllm-ascend" ]; then
@@ -180,6 +181,7 @@ install_aisbench() {
     BENCH_DIR="$WORKSPACE/vllm-ascend/benchmark"
 
     cp -r /tmp/aisbench-backup "$BENCH_DIR"
+    cp /tmp/_build_info_backup.py /vllm-workspace/vllm-ascend/vllm_ascend/_build_info.py 2>/dev/null || true
 
     cd "$BENCH_DIR"
     pip install -e . \
