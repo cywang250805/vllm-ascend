@@ -39,6 +39,7 @@
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
+#include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -2499,6 +2500,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "npu_sparse_attention_score(Tensor query, Tensor key, Tensor value,"
+        "                           Tensor select_idx, Tensor block_table,"
+        "                           int num_key_value_heads, float scale_value,"
+        "                           int block_size, int top_k, int inner_precise, *,"
+        "                           Tensor? select_num_idx=None, Tensor? actual_seq_lengths=None, Tensor? actual_seq_lengths_kv=None,"
+        "                           Tensor? q_dequant_scale=None, Tensor? k_dequant_scale=None, Tensor? v_dequant_scale=None) -> Tensor "
+    );
+    ops.impl("npu_sparse_attention_score", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attention_score);
+
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

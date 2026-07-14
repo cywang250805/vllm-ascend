@@ -142,7 +142,8 @@ def _is_moe_layer(config: PretrainedConfig, layer_idx: int) -> bool:
 def _deferred_tp_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     if get_tensor_model_parallel_world_size() == 1:
         return hidden_states
-    return tensor_model_parallel_all_reduce(hidden_states)
+    # return tensor_model_parallel_all_reduce(hidden_states)
+    return torch.ops.vllm.maybe_pad_and_reduce(hidden_states)
 
 
 def _get_text_config(vllm_config: VllmConfig) -> PretrainedConfig:
@@ -892,10 +893,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
-            self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
         
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1293,6 +1295,9 @@ class MiniMaxM3VLModel(nn.Module):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
         )
+        self.make_empty_intermediate_tensors = {
+            self.language_model.make_empty_intermediate_tensors
+        }
 
     def forward(
         self,
