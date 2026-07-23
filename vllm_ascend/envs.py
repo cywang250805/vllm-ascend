@@ -110,6 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Print one-time, rank-0 diagnostics for the MiniMax M3 GQA FP8 KV-cache
+    # allocation, ScatterPaKvCacheWithKScale write, and FIA read paths.
+    "VLLM_ASCEND_GQA_KV_FP8_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GQA_KV_FP8_DEBUG", "0"))
+    ),
 }
 
 # end-env-vars-definition

@@ -145,29 +145,23 @@ def _swiglu_mx_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if ASCEND_DEVICE_TYPE != AscendDeviceType.A5:
         raise RuntimeError("swiglu_mx_quant is only expected on Ascend A5.")
-    if not hasattr(torch.ops._C_ascend, "swiglu_mx_quant"):
-        raise RuntimeError(
-            "swiglu_mx_quant is unavailable in the current Ascend custom op "
-            "runtime. Please update the A5 custom op package."
-        )
-
-    hidden_states, swiglu_out_scale = torch.ops._C_ascend.swiglu_mx_quant(
-        x=hidden_states,
-        group_index=None,
-        dst_type=act_quant_type,
-        activate_dim=-1,
-        activate_left=True,
-        swiglu_mode=1,
-        clamp_limit=swiglu_limit,
-        glu_alpha=swiglu_alpha,
-        glu_bias=swiglu_beta,
-        group_mode=0,
-        axis=-1,
-        round_mode="rint",
-        scale_alg=1,
-        max_dtype_value=0.0,
+    # Ascend 950 deployments for MiniMax M3 may use a CANN package that does
+    # not contain the vllm-ascend custom ``aclnnSwigluMxQuant`` operator.
+    # Preserve its semantics with standard A5-supported operations: evaluate
+    # SwiGLU-OAI first, then perform dynamic MXFP quantization for GMM2.
+    hidden_states = _swigluoai_uninterleave(
+        hidden_states,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
-    return hidden_states, DeviceOperator.maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
+    hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states,
+        act_quant_type=act_quant_type,
+        use_mxfp_quant=True,
+    )
+    assert swiglu_out_scale is not None
+    return hidden_states, swiglu_out_scale
 
 
 def quant_apply_mlp(

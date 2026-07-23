@@ -34,7 +34,7 @@ def test_calls_cann_ops_transformer_binding() -> None:
         inputs = _inputs()
         scatter_pa_kv_cache_with_k_scale(*inputs)
 
-    custom_op.assert_called_once_with(*inputs, "BNBD")
+    custom_op.assert_called_once_with(*inputs, cache_layout="BNBD")
 
 
 def test_reports_missing_custom_operator_package() -> None:

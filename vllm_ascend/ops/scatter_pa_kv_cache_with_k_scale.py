@@ -46,5 +46,5 @@ def scatter_pa_kv_cache_with_k_scale(
         slot_mapping,
         key_scale,
         key_scale_cache,
-        "BNBD",
+        cache_layout="BNBD",
     )

@@ -5,7 +5,12 @@ from unittest.mock import patch
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp, unquant_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import (
+    _swiglu_mx_quant,
+    cumsum_group_list,
+    unified_apply_mlp,
+    unquant_apply_mlp,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -13,6 +18,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import AscendDeviceType
 
 MXFP4_TEST_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.float16)
 
@@ -60,6 +66,49 @@ class TestW4A8RuntimeFlags(unittest.TestCase):
         )
         self.assertFalse(
             MoEQuantParams(quant_type=QuantType.W8A8, is_per_channel_weight=True).use_w4a8_per_channel_gmm_swiglu
+        )
+
+
+class TestMiniMaxM3Mxfp8SwiGlu(unittest.TestCase):
+    def test_uses_standard_swiglu_then_dynamic_mx_quant(self):
+        hidden_states = torch.tensor(
+            [[10.0, -2.0, 7.0, -8.0]],
+            dtype=torch.bfloat16,
+        )
+        quantized = torch.ones((1, 2), dtype=torch.float16)
+        normalized_scale = torch.ones((1, 1, 2), dtype=torch.float32)
+
+        with (
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.ASCEND_DEVICE_TYPE",
+                AscendDeviceType.A5,
+            ),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.npu_dynamic_quant",
+                return_value=(quantized, normalized_scale),
+            ) as mock_dynamic_quant,
+        ):
+            output, scale = _swiglu_mx_quant(
+                hidden_states,
+                act_quant_type=torch.float8_e4m3fn,
+                swiglu_limit=5.0,
+                swiglu_alpha=1.0,
+                swiglu_beta=0.0,
+            )
+
+        self.assertIs(output, quantized)
+        self.assertIs(scale, normalized_scale)
+        quant_input = mock_dynamic_quant.call_args.args[0]
+        gate = torch.clamp(hidden_states[..., :2], max=5.0)
+        up = torch.clamp(hidden_states[..., 2:], min=-5.0, max=5.0)
+        expected = gate * torch.sigmoid(gate) * up
+        self.assertTrue(torch.equal(quant_input, expected))
+        self.assertEqual(
+            mock_dynamic_quant.call_args.kwargs,
+            {
+                "act_quant_type": torch.float8_e4m3fn,
+                "use_mxfp_quant": True,
+            },
         )
 
 
