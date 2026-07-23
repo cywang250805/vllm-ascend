@@ -67,6 +67,7 @@ from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.ops.scatter_pa_kv_cache_with_k_scale import scatter_pa_kv_cache_with_k_scale
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
@@ -1364,7 +1365,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dtype=torch.float32,
             device=key.device,
         )
-        torch_npu.npu_scatter_pa_kv_cache_with_k_scale(
+        scatter_pa_kv_cache_with_k_scale(
             key,
             value,
             self.key_cache,

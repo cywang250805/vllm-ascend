@@ -308,8 +308,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         )
 
     @patch(
-        "vllm_ascend.attention.attention_v1.torch_npu.npu_scatter_pa_kv_cache_with_k_scale",
-        create=True,
+        "vllm_ascend.attention.attention_v1.scatter_pa_kv_cache_with_k_scale",
     )
     def test_scatter_minimax_m3_fp8_kv_cache(self, mock_scatter):
         self.impl.key_cache = torch.empty(
