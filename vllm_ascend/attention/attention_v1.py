@@ -63,6 +63,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
+from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
@@ -71,6 +72,7 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+FP8_E4M3_MAX = 448.0
 _ATTN_KEYS_BUFFER = None
 
 
@@ -117,13 +119,11 @@ class AscendAttentionBackend(AttentionBackend):
         dst_kv_cache: list[torch.Tensor],
         src_to_dst: torch.Tensor,
     ) -> None:
-        src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]
-        dst_key_cache, dst_value_cache = dst_kv_cache[0], dst_kv_cache[1]
         src_indices = src_to_dst[:, 0]
         dst_indices = src_to_dst[:, 1]
 
-        dst_key_cache[dst_indices] = src_key_cache[src_indices].to(dst_key_cache.device)
-        dst_value_cache[dst_indices] = src_value_cache[src_indices].to(dst_key_cache.device)
+        for src_cache, dst_cache in zip(src_kv_cache, dst_kv_cache):
+            dst_cache[dst_indices] = src_cache[src_indices].to(dst_cache.device)
 
     @staticmethod
     def copy_blocks(
@@ -134,10 +134,8 @@ class AscendAttentionBackend(AttentionBackend):
         dst_indices = src_to_dists[:, 1]
 
         for kv_cache in kv_caches:
-            key_caches = kv_cache[0]
-            value_caches = kv_cache[1]
-            key_caches[dst_indices] = key_caches[src_indices]
-            value_caches[dst_indices] = value_caches[src_indices]
+            for cache in kv_cache:
+                cache[dst_indices] = cache[src_indices]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
@@ -268,6 +266,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     ) -> AttentionCGSupport:
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
+        if isinstance(kv_cache_spec, AscendGQAFp8AttentionSpec):
+            # Full-quant FIA graph replay does not carry the per-token Q/K
+            # scales yet.
+            return AttentionCGSupport.NEVER
         return AttentionCGSupport.ALWAYS
 
     def reorder_batch(self, input_batch, scheduler_output: "SchedulerOutput") -> bool:
@@ -428,6 +430,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.key_cache = None
         self.value_cache = None
+        self.k_scale_cache = None
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -1229,6 +1232,148 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
+    def _get_fia_fp8_params(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        torch.Tensor,
+        list[int],
+    ]:
+        assert self.key_cache is not None
+        assert self.value_cache is not None
+        assert self.k_scale_cache is not None
+
+        _, _, block_size, _ = self.key_cache.shape
+        block_table = attn_metadata.block_tables
+        actual_seq_lengths_kv = attn_metadata.seq_lens_list
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
+        elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+            batch_size = attn_metadata.seq_lens.shape[0]
+            block_table = block_table[:batch_size]
+
+        if block_table is not None and actual_seq_lengths_kv:
+            max_num_blocks = cdiv(max(actual_seq_lengths_kv), block_size)
+            block_table = block_table[:, :max_num_blocks]
+
+        return (
+            self.key_cache,
+            self.value_cache,
+            self.k_scale_cache.squeeze(-1),
+            block_size,
+            block_table,
+            actual_seq_lengths_kv,
+        )
+
+    def _forward_fia_fp8(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        (
+            key,
+            value,
+            k_scale,
+            block_size,
+            block_table,
+            actual_seq_lengths_kv,
+        ) = self._get_fia_fp8_params(attn_metadata)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+
+        query = (
+            query[:num_tokens]
+            .clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
+            .to(torch.float8_e4m3fn)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        q_scale = torch.ones(
+            (self.num_heads, num_tokens),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        v_scale = torch.ones(
+            self.num_kv_heads,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        p_scale = torch.ones(1, dtype=torch.float32, device=query.device)
+
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            key,
+            value,
+            atten_mask=attn_metadata.attn_mask,
+            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            dequant_scale_query=q_scale,
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            block_table=block_table,
+            block_size=block_size,
+            num_query_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+            input_layout="NTD_TND",
+            sparse_mode=3,
+            quant_scale_p=p_scale,
+            out_dtype=output.dtype,
+            query_quant_mode=3,
+            key_quant_mode=3,
+            value_quant_mode=2,
+            query_dtype=torch.float8_e4m3fn,
+            key_dtype=torch.float8_e4m3fn,
+            value_dtype=torch.float8_e4m3fn,
+            dequant_scale_query_dtype=torch.float32,
+            dequant_scale_key_dtype=torch.float32,
+            dequant_scale_value_dtype=torch.float32,
+            return_softmax_lse=False,
+        )
+        output[:num_tokens] = attn_output.view(
+            num_tokens,
+            self.num_heads,
+            self.head_size,
+        ).to(output.dtype)
+        return output
+
+    def _scatter_fp8_kv_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        assert self.key_cache is not None
+        assert self.value_cache is not None
+        assert self.k_scale_cache is not None
+
+        key = key.clamp(
+            min=-FP8_E4M3_MAX,
+            max=FP8_E4M3_MAX,
+        ).to(torch.float8_e4m3fn)
+        value = value.clamp(
+            min=-FP8_E4M3_MAX,
+            max=FP8_E4M3_MAX,
+        ).to(torch.float8_e4m3fn)
+        k_scale = torch.ones(
+            key.shape[:2],
+            dtype=torch.float32,
+            device=key.device,
+        )
+        torch_npu.npu_scatter_pa_kv_cache_with_k_scale(
+            key,
+            value,
+            self.key_cache,
+            self.value_cache,
+            slot_mapping,
+            k_scale,
+            self.k_scale_cache,
+        )
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1250,6 +1395,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+        if self.k_scale_cache is not None:
+            return self._forward_fia_fp8(query, attn_metadata, output)
         passed_key = key
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
@@ -1416,14 +1563,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.key_cache is None:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            if len(kv_cache) > 2:
+                self.k_scale_cache = kv_cache[2]
 
-        DeviceOperator.reshape_and_cache(
-            key=key,
-            value=value,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            slot_mapping=slot_mapping,
-        )
+        if self.k_scale_cache is not None:
+            self._scatter_fp8_kv_cache(key, value, slot_mapping)
+        else:
+            DeviceOperator.reshape_and_cache(
+                key=key,
+                value=value,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                slot_mapping=slot_mapping,
+            )
 
     def reshape_and_cache(
         self,
@@ -1437,17 +1589,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                if len(kv_cache) > 2:
+                    self.k_scale_cache = kv_cache[2]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            DeviceOperator.reshape_and_cache(
-                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
-                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                # quick fix to make sure slots is int32 for cross attention case.
-                # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
-            )
+            actual_key = key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key
+            actual_value = value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value
+            actual_slots = slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32)
+            if self.k_scale_cache is not None:
+                self._scatter_fp8_kv_cache(
+                    actual_key,
+                    actual_value,
+                    actual_slots,
+                )
+            else:
+                DeviceOperator.reshape_and_cache(
+                    key=actual_key,
+                    value=actual_value,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    slot_mapping=actual_slots,
+                )
             notify_kv_cache_written()
         return query, key, value, output
 
@@ -1467,6 +1629,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and self.sliding_window is None
             and using_paged_attention(num_tokens, self.vllm_config, self.head_size)
+            and self.k_scale_cache is None
         ):
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
@@ -1523,6 +1686,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and len(kv_cache) >= 2
             ):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                if isinstance(kv_cache, (list, tuple)) and len(kv_cache) > 2:
+                    self.k_scale_cache = kv_cache[2]
 
         output_padded = None
         if key is not None and value is not None:
