@@ -83,7 +83,7 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             original_shape = x.shape
             if x.dim() > 2:
                 x = x.view(-1, x.shape[-1])
-            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn,scale_alg=1)
             output_dtype = x.dtype
 
         if bias is not None and bias.dtype != torch.float32:
@@ -130,7 +130,6 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
                 "weight": tuple(layer.weight.data.shape),
                 "weight_scale": tuple(layer.weight_scale.data.shape),
             }
-
         n_dim, k_dim = layer.weight_scale.data.shape
         # Shape should be padded if it cannot be divided by 2
         if layer.weight_scale.data.shape[-1] % 2 != 0:
@@ -366,7 +365,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 "w2_weight": tuple(layer.w2_weight.data.shape),
                 "w2_weight_scale": tuple(layer.w2_weight_scale.data.shape),
             }
-
+        # layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(torch.float8_e8m0fnu)
+        # layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(torch.float8_e8m0fnu)
         g_num, n_size, k_size = layer.w13_weight_scale.shape
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
         g_num, n_size, k_size = layer.w2_weight_scale.shape

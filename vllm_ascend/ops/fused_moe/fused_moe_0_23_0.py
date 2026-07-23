@@ -98,6 +98,17 @@ class AscendMoERunner(MoERunner):
         trunc_size: int,
     ) -> torch.Tensor:
         states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
+        if states.dtype == torch.bfloat16 and isinstance(
+            self._quant_method, AscendUnquantizedFusedMoEMethod
+        ):
+            w13_weight = getattr(self.routed_experts, "w13_weight", None)
+            weight_ptr = w13_weight.data_ptr() if w13_weight is not None else -1
+            logger.error(
+                "[BF16_MOE][layer=%s][weight_ptr=%s] output_l1=%s",
+                self.layer_name,
+                weight_ptr,
+                states.to(torch.float).norm(p=1),
+            )
         return states[..., :trunc_size]
 
     # TODO: Remove this after drop v0.19.1 support
@@ -113,6 +124,15 @@ class AscendMoERunner(MoERunner):
         This delegates to the layer's forward_impl method which contains the
         Ascend-specific MoE computation logic.
         """
+        if hidden_states.dtype == torch.bfloat16 and isinstance(
+            layer.quant_method, AscendUnquantizedFusedMoEMethod
+        ):
+            logger.error(
+                "[BF16_MOE][layer=%s][weight_ptr=%s] input_l1=%s",
+                layer.layer_name,
+                layer.w13_weight.data_ptr(),
+                hidden_states.to(torch.float).norm(p=1),
+            )
         if self.shared_experts is None:
             result = layer.forward_impl(hidden_states, router_logits)
             # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
@@ -211,9 +231,7 @@ class AscendFusedMoE(FusedMoE):
             and self.e_score_correction_bias is not None
             and not vllm_config.model_config.is_deepseek_mla
         ):
-            self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
-                dtype=vllm_config.model_config.dtype
-            )
+            pass
         self._gate = kwargs.get("gate")
 
         # init moe
@@ -636,7 +654,7 @@ class AscendFusedMoE(FusedMoE):
                 # Execute dynamic quant concurrently with MoE gate.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                    hidden_states, dst_type=torch.float8_e4m3fn
+                    hidden_states, dst_type=torch.float8_e4m3fn,scale_alg=1
                 )
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
@@ -663,6 +681,13 @@ class AscendFusedMoE(FusedMoE):
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)
                 part1_out = self._shared_experts_part1(hidden_states)
+
+                if part1_out.dtype == torch.bfloat16 and self.quant_type == QuantType.NONE:
+                    logger.error(
+                        "[BF16_MOE][layer=%s] shared_gate_up_l1=%s",
+                        self.layer_name,
+                        part1_out.to(torch.float).norm(p=1),
+                    )
                 # Execute the down projection concurrently with the combine
                 # communication.
                 maybe_wait_event(fused_moe_evts.before_combine)
@@ -673,6 +698,13 @@ class AscendFusedMoE(FusedMoE):
         if self.multistream_overlap_shared_expert:
             torch.npu.current_stream().wait_stream(shared_experts_calculation_stream())
 
+
+        if shared_out.dtype == torch.bfloat16 and self.quant_type == QuantType.NONE:
+            logger.error(
+                "[BF16_MOE][layer=%s] shared_down_l1=%s",
+                self.layer_name,
+                shared_out.to(torch.float).norm(p=1),
+            )
         # NOTE: This is exactly the opposite of
         # `maybe_all_reduce_tensor_model_parallel`
         moe_comm_type = _EXTRA_CTX.moe_comm_type

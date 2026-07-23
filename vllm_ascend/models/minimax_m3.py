@@ -23,11 +23,12 @@
 # limitations under the License.
 """Inference-only MiniMaxM3 model."""
 
+import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Any
-
+import vllm
 import torch
 from torch import nn
 from transformers import BatchFeature, PretrainedConfig
@@ -103,6 +104,12 @@ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm_ascend.attention.msa_m3 import MiniMaxM3SparseAttention
 from vllm_ascend.models.minimax_m3_vit import MiniMaxVLVisionModel
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+_DECODE_ITEM = 0
+_LAYER_IDX = -1
+
+def get_minimax_m3_decode_items_and_layers():
+    return _DECODE_ITEM,_LAYER_IDX
 
 
 logger = init_logger(__name__)
@@ -267,6 +274,7 @@ class MiniMaxM3MoE(nn.Module):
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
             )
+            
             self.e_score_correction_bias.weight_loader = (
                 MiniMaxM3MoE.ebias_weight_loader
             )
@@ -323,7 +331,13 @@ class MiniMaxM3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
+        # if self.e_score_correction_bias is not None:
+        #     logger.error(
+        #     f"e_score_correction_bias: "
+        #     f"dtype={self.e_score_correction_bias.dtype}, "
+        # )
+        # else:
+        #     logger.error("e_score_correction_bias=None")
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
@@ -537,6 +551,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+
+        # global _DECODE_ITEM
+        # global _LAYER_IDX
+        # _LAYER_IDX = self.layer_idx
+
+        # logger.error(f" ====>inxx COUNT {_LAYER_IDX}, hidden_states shape : {hidden_states.shape}, l1_norm : {torch.norm(hidden_states.float(), p=1)}" )
+        # if residual is not None:
+        #     logger.error(f" ====>inxx COUNT {_LAYER_IDX}, residual shape : {residual.shape}, l1_norm : {torch.norm(residual.float(), p=1)}" )
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -558,6 +581,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+  
+        # logger.error(f" ====>outxx COUNT {_LAYER_IDX}, hidden_states shape : {hidden_states.shape}, l1_norm : {torch.norm(hidden_states.float(), p=1)}" )
+        # if residual is not None:
+        #     logger.error(f" ====>outxx COUNT {_LAYER_IDX}, residual shape : {residual.shape}, l1_norm : {torch.norm(residual.float(), p=1)}" )
 
         return hidden_states, residual
 
@@ -641,13 +668,21 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        # COUNT = 0
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            # COUNT += 1
+            # logger.error(f" ====> COUNT input {COUNT}, hidden_states shape : {hidden_states.shape}, l1_norm : {torch.norm(hidden_states.float(), p=1)}" )
+            # if residual is not None:
+            #     logger.error(f" ====> COUNT input {COUNT}, residual shape : {residual.shape}, l1_norm : {torch.norm(residual.float(), p=1)}" )
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
+            # logger.error(f" ====> COUNT out {COUNT}, hidden_states shape : {hidden_states.shape}, l1_norm : {torch.norm(hidden_states.float(), p=1)}" )
+            # if residual is not None:
+            #     logger.error(f" ====> COUNT out {COUNT}, residual shape : {residual.shape}, l1_norm : {torch.norm(residual.float(), p=1)}" )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -916,6 +951,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        global _DECODE_ITEM
+        _DECODE_ITEM += 1
         return hidden_states
 
     def compute_logits(
@@ -923,6 +960,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        # logger.error(f"=====> Item {_DECODE_ITEM} logits is: {torch.norm(logits.float(), p = 1)}, logits shape is: {logits.shape} ")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

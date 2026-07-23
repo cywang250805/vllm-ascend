@@ -21,7 +21,8 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
-
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
@@ -982,7 +983,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             )
 
         if dynamic_scale is None:
-            hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=act_quant_type)
+            hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=act_quant_type, scale_alg=1)
 
         return hidden_states, A5DeviceAdaptor.maybe_normalize_mxfp_scale_layout(dynamic_scale)
 

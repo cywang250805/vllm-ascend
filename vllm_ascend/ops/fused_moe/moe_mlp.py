@@ -40,6 +40,11 @@ from vllm_ascend.utils import (
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
 
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+
+
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
     return fusion and dynamic_eplb and enable_custom_op()
 
@@ -104,6 +109,32 @@ def _ensure_clipped_swiglu_supported() -> None:
         )
 
 
+def _swigluoai_uninterleave(
+    hidden_states: torch.Tensor,
+    *,
+    swiglu_limit: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+) -> torch.Tensor:
+    if ASCEND_DEVICE_TYPE == AscendDeviceType.A5:
+        hidden_dim = hidden_states.shape[-1] // 2
+        gate = torch.clamp(hidden_states[..., :hidden_dim], max=swiglu_limit)
+        up = torch.clamp(
+            hidden_states[..., hidden_dim:],
+            min=-swiglu_limit,
+            max=swiglu_limit,
+        )
+        return gate * torch.sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)
+
+    return torch_npu.npu_clipped_swiglu(
+        hidden_states,
+        alpha=swiglu_alpha,
+        limit=swiglu_limit,
+        bias=swiglu_beta,
+        interleaved=False,
+    )
+
+
 def _swiglu_mx_quant(
     hidden_states: torch.Tensor,
     *,
@@ -133,7 +164,7 @@ def _swiglu_mx_quant(
         group_mode=0,
         axis=-1,
         round_mode="rint",
-        scale_alg=0,
+        scale_alg=1,
         max_dtype_value=0.0,
     )
     return hidden_states, DeviceOperator.maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
@@ -503,7 +534,6 @@ def quant_apply_mlp(
         )
     return hidden_states, before_gmm2_evt
 
-
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -525,7 +555,12 @@ def unquant_apply_mlp(
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
+    
+    from vllm_ascend.models.minimax_m3 import get_minimax_m3_decode_items_and_layers
+    decode_item, layer_idx = get_minimax_m3_decode_items_and_layers()
+    from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 
+    # logger.error(f" ====> ITEM {decode_item}/")
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w1],
@@ -535,6 +570,13 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+    if gate_up_out.dtype == torch.bfloat16:
+        logger.error(
+            "[BF16_MOE][weight_ptr=%s] routed_gmm1_l1=%s",
+            w1.data_ptr(),
+            gate_up_out.to(torch.float).norm(p=1),
+        )
+
 
     lora_routing = None
     if lora_context is not None:
@@ -557,13 +599,11 @@ def unquant_apply_mlp(
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     elif activation == "swigluoai_uninterleave":
-        _ensure_clipped_swiglu_supported()
-        gate_up_out = torch_npu.npu_clipped_swiglu(
+        gate_up_out = _swigluoai_uninterleave(
             gate_up_out,
-            alpha=swiglu_alpha,
-            limit=swiglu_limit,
-            bias=swiglu_beta,
-            interleaved=False,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
@@ -580,6 +620,13 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
+    if hidden_states.dtype == torch.bfloat16:
+        logger.error(
+            "[BF16_MOE][weight_ptr=%s] routed_gmm2_l1=%s",
+            w1.data_ptr(),
+            hidden_states.to(torch.float).norm(p=1),
+        )
     if lora_routing is not None:
         moe_lora_apply_w2(
             lora_context,

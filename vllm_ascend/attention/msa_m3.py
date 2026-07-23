@@ -439,8 +439,8 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
                 self.init_blocks,
                 self.local_blocks,
             )
-        return decode_topk, prefill_topk
 
+        return decode_topk, prefill_topk
 
 class AscendMiniMaxM3Indexer(nn.Module):
     def __init__(
@@ -744,38 +744,40 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
 
-        if main_md.num_decodes > 0:
-            d = main_md.decode
-            assert d is not None and decode_topk is not None
-            minimax_m3_sparse_attn_decode(
-                q[:nd],
-                kv_cache,
-                decode_topk,
-                d.block_table,
-                d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
-                out[:nd],
-                d.decode_query_len,
-            )
+        # ========================torch======================== #
 
-        if main_md.num_prefills > 0:
-            p = main_md.prefill
-            assert p is not None and prefill_topk is not None
-            minimax_m3_sparse_attn(
-                q[nd:],
-                kv_cache,
-                prefill_topk,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                self.num_kv_heads,
-                self.scale,
-                out[nd:],
-            )
+        # if main_md.num_decodes > 0:
+        #     d = main_md.decode
+        #     assert d is not None and decode_topk is not None
+        #     minimax_m3_sparse_attn_decode(
+        #         q[:nd],
+        #         kv_cache,
+        #         decode_topk,
+        #         d.block_table,
+        #         d.seq_lens,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         out[:nd],
+        #         d.decode_query_len,
+        #     )
 
+        # if main_md.num_prefills > 0:
+        #     p = main_md.prefill
+        #     assert p is not None and prefill_topk is not None
+        #     minimax_m3_sparse_attn(
+        #         q[nd:],
+        #         kv_cache,
+        #         prefill_topk,
+        #         p.block_table,
+        #         p.cu_seqlens_q,
+        #         p.seq_lens,
+        #         p.context_lens,
+        #         p.max_query_len,
+        #         self.num_kv_heads,
+        #         self.scale,
+        #         out[nd:],
+        #     )
+        # ========================torch======================== #
 
         # key_cache, value_cache = kv_cache[0], kv_cache[1]
 
@@ -822,39 +824,41 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         #     )
         #     output[nd:num_tokens].view(-1, self.num_heads, hd).copy_(prefill_out)
 
-        # if main_md.num_decodes > 0:
-        #     d = main_md.decode
-        #     assert d is not None and decode_topk is not None
-        #     minimax_m3_sparse_attn_decode_ascendc(
-        #         q[:nd],
-        #         kv_cache,
-        #         decode_topk,
-        #         d.block_table,
-        #         d.seq_lens,
-        #         self.num_kv_heads,
-        #         self.scale,
-        #         out[:nd],
-        #         d.decode_query_len,
-        #         block_size=self.block_size,
-        #     )
+        # ========================ascendC======================== #
+        if main_md.num_decodes > 0:
+            d = main_md.decode
+            assert d is not None and decode_topk is not None
+            minimax_m3_sparse_attn_decode_ascendc(
+                q[:nd],
+                kv_cache,
+                decode_topk,
+                d.block_table,
+                d.seq_lens,
+                self.num_kv_heads,
+                self.scale,
+                out[:nd],
+                d.decode_query_len,
+                block_size=self.block_size,
+            )
 
-        # if main_md.num_prefills > 0:
-        #     p = main_md.prefill
-        #     assert p is not None and prefill_topk is not None
-        #     minimax_m3_sparse_attn_ascendc(
-        #         q[nd:],
-        #         kv_cache,
-        #         prefill_topk,
-        #         p.block_table,
-        #         p.cu_seqlens_q,
-        #         p.seq_lens,
-        #         p.context_lens,
-        #         p.max_query_len,
-        #         self.num_kv_heads,
-        #         self.scale,
-        #         out[nd:],
-        #         block_size=self.block_size,
-        #     )
+        if main_md.num_prefills > 0:
+            p = main_md.prefill
+            assert p is not None and prefill_topk is not None
+            minimax_m3_sparse_attn_ascendc(
+                q[nd:],
+                kv_cache,
+                prefill_topk,
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                p.context_lens,
+                p.max_query_len,
+                self.num_kv_heads,
+                self.scale,
+                out[nd:],
+                block_size=self.block_size,
+            )
+        # # ========================ascendC======================== #
         return output
 
         

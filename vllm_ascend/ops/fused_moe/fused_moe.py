@@ -383,9 +383,7 @@ else:
                 and self.e_score_correction_bias is not None
                 and not vllm_config.model_config.is_deepseek_mla
             ):
-                self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
-                    dtype=vllm_config.model_config.dtype
-                )
+                pass
 
             self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
             self.multistream_overlap_shared_expert = (
@@ -780,7 +778,7 @@ else:
                     # Execute dynamic quant concurrently with MoE gate.
                     torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                     quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                        hidden_states, dst_type=torch.float8_e4m3fn
+                        hidden_states, dst_type=torch.float8_e4m3fn,scale_alg=1
                     )
                     # Execute the gate projection and activation concurrently with the
                     # dispatch communication.
