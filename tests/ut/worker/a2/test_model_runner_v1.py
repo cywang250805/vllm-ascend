@@ -7,6 +7,7 @@ import torch
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -85,6 +86,63 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    def test_minimax_m3_fp8_cache_includes_k_scale(self):
+        runner = self._build_runner()
+        kv_cache_spec = AscendGQAFp8AttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=64,
+            head_size_v=64,
+            dtype=torch.float8_e4m3fn,
+        )
+        self.assertEqual(kv_cache_spec.k_page_size_bytes, 2048)
+        self.assertEqual(kv_cache_spec.v_page_size_bytes, 2048)
+        self.assertEqual(kv_cache_spec.k_scale_page_size_bytes, 128)
+        self.assertEqual(kv_cache_spec.page_size_bytes, 4224)
+
+        layer_name = "model.layers.0.self_attn.attn"
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=kv_cache_spec.page_size_bytes * 2,
+                    shared_by=[layer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[layer_name],
+                    kv_cache_spec=kv_cache_spec,
+                )
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+        raw_k, raw_v, raw_k_scale = raw_caches[layer_name]
+        self.assertEqual(raw_k.numel(), 4096)
+        self.assertEqual(raw_v.numel(), 4096)
+        self.assertEqual(raw_k_scale.numel(), 256)
+
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=kv_cache_spec,
+                backend=runner.attn_backend,
+                layer_names=[layer_name],
+            )
+        ]
+        kv_caches = runner._reshape_kv_cache_tensors(
+            kv_cache_config,
+            raw_caches,
+        )
+        k_cache, v_cache, k_scale_cache = kv_caches[layer_name]
+        self.assertEqual(k_cache.shape, (2, 2, 16, 64))
+        self.assertEqual(v_cache.shape, (2, 2, 16, 64))
+        self.assertEqual(k_scale_cache.shape, (2, 2, 16, 1))
+        self.assertEqual(k_cache.dtype, torch.float8_e4m3fn)
+        self.assertEqual(v_cache.dtype, torch.float8_e4m3fn)
+        self.assertEqual(k_scale_cache.dtype, torch.float32)
+        self.assertTrue(torch.all(k_scale_cache == 1.0))
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
