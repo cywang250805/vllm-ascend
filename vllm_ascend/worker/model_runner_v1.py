@@ -197,6 +197,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
 )
+from vllm_ascend.gqa_kv_fp8_debug import log_gqa_kv_fp8_once
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -4472,6 +4473,18 @@ class NPUModelRunner(GPUModelRunner):
                         ).view(k_scale_shape)
                         k_scale_cache.fill_(1.0)
                         kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache)
+                        log_gqa_kv_fp8_once(
+                            "cache_allocation",
+                            "allocated a three-tensor dense cache and included k_scale_cache in page_size: "
+                            f"layer={layer_name}, num_blocks={num_blocks}, "
+                            f"page_bytes={current_kv_cache_spec.page_size_bytes} "
+                            f"(K={current_kv_cache_spec.k_page_size_bytes}, "
+                            f"V={current_kv_cache_spec.v_page_size_bytes}, "
+                            f"K-scale={current_kv_cache_spec.k_scale_page_size_bytes}), "
+                            f"K={tuple(k_cache.shape)}/{k_cache.dtype}, "
+                            f"V={tuple(v_cache.shape)}/{v_cache.dtype}, "
+                            f"K-scale={tuple(k_scale_cache.shape)}/{k_scale_cache.dtype}.",
+                        )
                         continue
 
                     # cache_only_layers (extract_hidden_states) are allocated

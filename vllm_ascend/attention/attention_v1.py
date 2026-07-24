@@ -65,6 +65,10 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.gqa_kv_fp8_debug import (
+    claim_gqa_kv_fp8_debug_event,
+    log_gqa_kv_fp8,
+)
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.scatter_pa_kv_cache_with_k_scale import scatter_pa_kv_cache_with_k_scale
@@ -1286,6 +1290,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ) = self._get_fia_fp8_params(attn_metadata)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
 
+        if claim_gqa_kv_fp8_debug_event("fia_read"):
+            try:
+                first_block = None
+                scale_sample = []
+                if block_table is not None and block_table.numel() > 0:
+                    first_block = int(block_table.flatten()[0].item())
+                    if first_block >= 0:
+                        scale_sample = (
+                            k_scale[first_block, :, 0]
+                            .detach()
+                            .float()
+                            .cpu()
+                            .tolist()
+                        )
+                log_gqa_kv_fp8(
+                    "FIA v2 is reading the FP8 caches and k_scale_cache: "
+                    f"query_shape={tuple(query[:num_tokens].shape)}, "
+                    f"key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, "
+                    f"k_scale_shape={tuple(k_scale.shape)}, k_scale_dtype={k_scale.dtype}, "
+                    f"k_scale_aliases_cache={k_scale.data_ptr() == self.k_scale_cache.data_ptr()}, "
+                    f"block_size={block_size}, first_block={first_block}, "
+                    f"first_block_scale_sample={scale_sample[:8]}, "
+                    "query/key/value_quant_mode=3/3/2, output keeps the requested dtype.",
+                )
+            except Exception as exc:
+                log_gqa_kv_fp8(
+                    f"FIA read path was reached, but collecting its diagnostic sample failed: {exc!r}",
+                )
+
         query = (
             query[:num_tokens]
             .clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
@@ -1335,6 +1368,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dequant_scale_value_dtype=torch.float32,
             return_softmax_lse=False,
         )
+        if claim_gqa_kv_fp8_debug_event("fia_output"):
+            try:
+                output_sample = (
+                    attn_output.flatten()[:8]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+                log_gqa_kv_fp8(
+                    "FIA v2 completed the full-quantized GQA calculation: "
+                    f"attention_output_shape={tuple(attn_output.shape)}, "
+                    f"attention_output_dtype={attn_output.dtype}, "
+                    f"attention_output_sample={output_sample}.",
+                )
+            except Exception as exc:
+                log_gqa_kv_fp8(
+                    "FIA v2 completed, but collecting its output diagnostic sample "
+                    f"failed: {exc!r}",
+                )
         output[:num_tokens] = attn_output.view(
             num_tokens,
             self.num_heads,
@@ -1374,6 +1427,46 @@ class AscendAttentionBackendImpl(AttentionImpl):
             k_scale,
             self.k_scale_cache,
         )
+        if claim_gqa_kv_fp8_debug_event("scatter_write"):
+            try:
+                valid_token_indices = torch.nonzero(slot_mapping >= 0).flatten()
+                if valid_token_indices.numel() > 0:
+                    token_index = int(valid_token_indices[0].item())
+                    slot = int(slot_mapping[token_index].item())
+                    block_size = self.k_scale_cache.shape[2]
+                    block_index, block_offset = divmod(slot, block_size)
+                    source_scale = (
+                        k_scale[token_index]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                    )
+                    cached_scale = (
+                        self.k_scale_cache[block_index, :, block_offset, 0]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                    )
+                    max_abs_diff = max(
+                        (abs(lhs - rhs) for lhs, rhs in zip(source_scale, cached_scale)),
+                        default=0.0,
+                    )
+                    log_gqa_kv_fp8(
+                        "ScatterPaKvCacheWithKScale wrote the dense FP8 KV cache: "
+                        f"key/value_dtype={key.dtype}/{value.dtype}, "
+                        f"slot={slot} -> block={block_index}, offset={block_offset}, "
+                        f"k_scale_dtype={k_scale.dtype}, "
+                        f"source_scale_sample={source_scale[:8]}, "
+                        f"cached_scale_sample={cached_scale[:8]}, "
+                        f"sample_max_abs_diff={max_abs_diff}.",
+                    )
+            except Exception as exc:
+                log_gqa_kv_fp8(
+                    "ScatterPaKvCacheWithKScale write path was reached, "
+                    f"but collecting its diagnostic sample failed: {exc!r}",
+                )
 
     def forward_fused_infer_attention(
         self,
