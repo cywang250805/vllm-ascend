@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
@@ -143,6 +143,57 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(v_cache.dtype, torch.float8_e4m3fn)
         self.assertEqual(k_scale_cache.dtype, torch.float32)
         self.assertTrue(torch.all(k_scale_cache == 1.0))
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_minimax_m3_fp8_full_attention_spec_conversion(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.shared_kv_cache_layers = {}
+        runner.vllm_config.cache_config.cache_dtype = "fp8"
+
+        source_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=64,
+            head_size_v=32,
+            dtype=torch.float8_e4m3fn,
+            sliding_window=4096,
+            attention_chunk_size=2048,
+        )
+        attn_module = Attention.__new__(Attention)
+        torch.nn.Module.__init__(attn_module)
+        attn_module.kv_sharing_target_layer_name = None
+        attn_module._ascend_minimax_m3_dense_gqa = True
+        attn_module.get_kv_cache_spec = MagicMock(return_value=source_spec)
+
+        layer_name = "model.layers.0.self_attn.attn"
+        mock_get_layers.return_value = {layer_name: attn_module}
+
+        converted_spec = runner.get_kv_cache_spec()[layer_name]
+
+        self.assertIsInstance(converted_spec, AscendGQAFp8AttentionSpec)
+        self.assertEqual(converted_spec.block_size, source_spec.block_size)
+        self.assertEqual(converted_spec.num_kv_heads, source_spec.num_kv_heads)
+        self.assertEqual(converted_spec.head_size, source_spec.head_size)
+        self.assertEqual(converted_spec.head_size_v, source_spec.head_size_v)
+        self.assertEqual(converted_spec.dtype, source_spec.dtype)
+        self.assertEqual(converted_spec.kv_quant_mode, source_spec.kv_quant_mode)
+        self.assertEqual(converted_spec.page_size_padded, source_spec.page_size_padded)
+        self.assertEqual(converted_spec.sliding_window, source_spec.sliding_window)
+        self.assertEqual(
+            converted_spec.attention_chunk_size,
+            source_spec.attention_chunk_size,
+        )
+        self.assertEqual(
+            converted_spec.page_size_bytes,
+            converted_spec.k_page_size_bytes
+            + converted_spec.v_page_size_bytes
+            + converted_spec.k_scale_page_size_bytes,
+        )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")

@@ -4992,10 +4992,8 @@ class NPUModelRunner(GPUModelRunner):
                             dtype=spec.dtype,
                             kv_quant_mode=spec.kv_quant_mode,
                             page_size_padded=spec.page_size_padded,
-                            indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
                             sliding_window=spec.sliding_window,
                             attention_chunk_size=spec.attention_chunk_size,
-                            non_causal=spec.non_causal,
                         )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
