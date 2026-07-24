@@ -15,9 +15,12 @@
 # This file is a part of the vllm-ascend project.
 
 
+import os
+
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -39,10 +42,7 @@ from vllm_ascend.utils import (
 
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
 
-
-from vllm.logger import init_logger
 logger = init_logger(__name__)
-
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -143,30 +143,38 @@ def _swiglu_mx_quant(
     swiglu_alpha: float,
     swiglu_beta: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if ASCEND_DEVICE_TYPE != AscendDeviceType.A5:
-        raise RuntimeError("swiglu_mx_quant is only expected on Ascend A5.")
-    if not hasattr(torch.ops._C_ascend, "swiglu_mx_quant"):
-        raise RuntimeError(
-            "swiglu_mx_quant is unavailable in the current Ascend custom op "
-            "runtime. Please update the A5 custom op package."
+    ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if "vendors/custom_nn" not in ld_library_path:
+        logger.warning_once(
+            "swiglu_mx_quant custom op not found in LD_LIBRARY_PATH. "
+            "Falling back to _swigluoai_uninterleave + npu_dynamic_mx_quant."
         )
-
-    hidden_states, swiglu_out_scale = torch.ops._C_ascend.swiglu_mx_quant(
-        x=hidden_states,
-        group_index=None,
-        dst_type=act_quant_type,
-        activate_dim=-1,
-        activate_left=True,
-        swiglu_mode=1,
-        clamp_limit=swiglu_limit,
-        glu_alpha=swiglu_alpha,
-        glu_bias=swiglu_beta,
-        group_mode=0,
-        axis=-1,
-        round_mode="rint",
-        scale_alg=1,
-        max_dtype_value=0.0,
-    )
+        hidden_states = _swigluoai_uninterleave(
+            hidden_states,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=act_quant_type, scale_alg=1
+        )
+    else:
+        hidden_states, swiglu_out_scale = torch_npu.npu_swiglu_mx_quant(
+            hidden_states,
+            group_index=None,
+            dst_type=act_quant_type,
+            activate_dim=-1,
+            activate_left=True,
+            swiglu_mode=1,
+            clamp_limit=swiglu_limit,
+            glu_alpha=swiglu_alpha,
+            glu_beta=swiglu_beta,
+            group_mode=0,
+            axis=-1,
+            round_mode="rint",
+            scale_alg=1,
+            max_dtype_value=0.0,
+        )
     return hidden_states, DeviceOperator.maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
 
 
@@ -534,6 +542,7 @@ def quant_apply_mlp(
         )
     return hidden_states, before_gmm2_evt
 
+
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -555,8 +564,9 @@ def unquant_apply_mlp(
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
-    
+
     from vllm_ascend.models.minimax_m3 import get_minimax_m3_decode_items_and_layers
+
     decode_item, layer_idx = get_minimax_m3_decode_items_and_layers()
     from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 
@@ -576,7 +586,6 @@ def unquant_apply_mlp(
             w1.data_ptr(),
             gate_up_out.to(torch.float).norm(p=1),
         )
-
 
     lora_routing = None
     if lora_context is not None:
