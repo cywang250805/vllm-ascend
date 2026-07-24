@@ -89,14 +89,34 @@ def main() -> None:
         cache_layout=CACHE_LAYOUT,
     )
     torch.npu.synchronize()
-    print(f"operator return value: {result!r}")
+
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise AssertionError(
+            "Expected the operator to return "
+            "(key_cache, value_cache, key_scale_cache), "
+            f"but got {type(result).__name__}: {result!r}"
+        )
+
+    key_cache_out, value_cache_out, key_scale_cache_out = result
+    cache_pairs = (
+        ("K cache", key_cache, key_cache_out),
+        ("V cache", value_cache, value_cache_out),
+        ("K-scale cache", key_scale_cache, key_scale_cache_out),
+    )
+    for name, cache_in, cache_out in cache_pairs:
+        print(
+            f"{name}: output shape={tuple(cache_out.shape)}, "
+            f"dtype={cache_out.dtype}, "
+            f"same_tensor={cache_out is cache_in}, "
+            f"same_storage={cache_out.data_ptr() == cache_in.data_ptr()}"
+        )
 
     for token_index, slot in enumerate((0, 17, 5)):
-        _assert_slot(key_cache, key[token_index], slot)
-        _assert_slot(value_cache, value[token_index], slot)
+        _assert_slot(key_cache_out, key[token_index], slot)
+        _assert_slot(value_cache_out, value[token_index], slot)
         block_index = slot // BLOCK_SIZE
         block_offset = slot % BLOCK_SIZE
-        actual_scale = key_scale_cache[block_index, :, block_offset, 0]
+        actual_scale = key_scale_cache_out[block_index, :, block_offset, 0]
         torch.testing.assert_close(
             actual_scale.cpu(),
             key_scale[token_index].cpu(),
@@ -104,10 +124,17 @@ def main() -> None:
             atol=0,
         )
 
-    assert torch.count_nonzero(key_cache.float()).item() == torch.count_nonzero(key.float()).item()
-    assert torch.count_nonzero(value_cache.float()).item() == torch.count_nonzero(value.float()).item()
-    assert torch.count_nonzero(key_scale_cache).item() == key_scale.numel()
-    print("PASS: K cache, V cache, and K-scale cache were updated at all requested slots.")
+    assert torch.count_nonzero(key_cache_out.float()).item() == torch.count_nonzero(
+        key.float()
+    ).item()
+    assert torch.count_nonzero(value_cache_out.float()).item() == torch.count_nonzero(
+        value.float()
+    ).item()
+    assert torch.count_nonzero(key_scale_cache_out).item() == key_scale.numel()
+    print(
+        "PASS: the returned K cache, V cache, and K-scale cache contain "
+        "the expected values at all requested slots."
+    )
 
 
 if __name__ == "__main__":
