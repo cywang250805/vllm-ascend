@@ -1335,6 +1335,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        value = value.contiguous()
         _log_fia_layout_once(
             "forward_fused_infer_attention",
             query,
@@ -1945,6 +1946,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             # block_table is None for prefill; FIA ignores block_size in this case.
             # Use cache block_size for consistency rather than a magic number.
             cache_block_size = self.key_cache.shape[1]  # type: ignore[attr-defined]
+            prefill_v = prefill_v.contiguous()
             _log_fia_layout_once(
                 "c8_chunked_prefill",
                 prefill_q,
@@ -2016,6 +2018,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 key = (key.to(query.dtype) - layer._c8_k_offset) * layer._c8_k_scale
                 value = (value.to(query.dtype) - layer._c8_v_offset) * layer._c8_v_scale
 
+        value = value.contiguous()
         _log_fia_layout_once(
             "c8_fused_infer_attention",
             query,
