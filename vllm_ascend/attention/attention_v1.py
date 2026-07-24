@@ -15,14 +15,17 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
+import torch.distributed as dist
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -72,6 +75,69 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_FIA_LAYOUT_DEBUG_EVENTS: set[str] = set()
+logger = init_logger(__name__)
+
+
+def _is_global_rank_zero() -> bool:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    rank = os.getenv("RANK")
+    if rank is None:
+        return True
+    try:
+        return int(rank) == 0
+    except ValueError:
+        return False
+
+
+def _tensor_layout(tensor: torch.Tensor) -> str:
+    return (
+        f"shape={tuple(tensor.shape)}, stride={tensor.stride()}, "
+        f"storage_offset={tensor.storage_offset()}, dtype={tensor.dtype}, "
+        f"contiguous={tensor.is_contiguous()}"
+    )
+
+
+def _log_fia_layout_once(
+    site: str,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_table: torch.Tensor | None,
+    attn_state: "AscendAttentionState",
+    *,
+    original_key: torch.Tensor | None = None,
+    original_value: torch.Tensor | None = None,
+) -> None:
+    if os.getenv("VLLM_ASCEND_FIA_CONTIGUITY_DEBUG", "0") != "1" or not _is_global_rank_zero():
+        return
+
+    pa_mode = "PA" if block_table is not None else "non-PA"
+    event = f"{site}:{attn_state}:{pa_mode}:value_contiguous={value.is_contiguous()}"
+    if event in _FIA_LAYOUT_DEBUG_EVENTS:
+        return
+    _FIA_LAYOUT_DEBUG_EVENTS.add(event)
+
+    original_layout = ""
+    if original_key is not None and original_value is not None:
+        original_layout = (
+            f", original_key=({_tensor_layout(original_key)}), "
+            f"original_value=({_tensor_layout(original_value)})"
+        )
+    block_table_shape = None if block_table is None else tuple(block_table.shape)
+    logger.warning(
+        "[FIA_CONTIGUITY_DEBUG] site=%s, attn_state=%s, mode=%s, "
+        "block_table_shape=%s, query=(%s), key=(%s), value=(%s)%s",
+        site,
+        attn_state,
+        pa_mode,
+        block_table_shape,
+        _tensor_layout(query),
+        _tensor_layout(key),
+        _tensor_layout(value),
+        original_layout,
+    )
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1269,6 +1335,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        _log_fia_layout_once(
+            "forward_fused_infer_attention",
+            query,
+            key,
+            value,
+            block_table,
+            attn_metadata.attn_state,
+            original_key=passed_key,
+            original_value=passed_value,
+        )
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -1869,6 +1945,16 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             # block_table is None for prefill; FIA ignores block_size in this case.
             # Use cache block_size for consistency rather than a magic number.
             cache_block_size = self.key_cache.shape[1]  # type: ignore[attr-defined]
+            _log_fia_layout_once(
+                "c8_chunked_prefill",
+                prefill_q,
+                prefill_k,
+                prefill_v,
+                None,
+                attn_metadata.attn_state,
+                original_key=float_key,
+                original_value=float_value,
+            )
             attn_out, _ = torch_npu.npu_fused_infer_attention_score(
                 query=prefill_q,
                 key=prefill_k,
@@ -1930,6 +2016,14 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 key = (key.to(query.dtype) - layer._c8_k_offset) * layer._c8_k_scale
                 value = (value.to(query.dtype) - layer._c8_v_offset) * layer._c8_v_scale
 
+        _log_fia_layout_once(
+            "c8_fused_infer_attention",
+            query,
+            key,
+            value,
+            block_table,
+            attn_metadata.attn_state,
+        )
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
