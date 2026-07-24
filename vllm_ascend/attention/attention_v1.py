@@ -1510,6 +1510,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        value = value.contiguous()
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -2128,6 +2129,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             # block_table is None for prefill; FIA ignores block_size in this case.
             # Use cache block_size for consistency rather than a magic number.
             cache_block_size = self.key_cache.shape[1]  # type: ignore[attr-defined]
+            prefill_v = prefill_v.contiguous()
             attn_out, _ = torch_npu.npu_fused_infer_attention_score(
                 query=prefill_q,
                 key=prefill_k,
@@ -2189,6 +2191,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 key = (key.to(query.dtype) - layer._c8_k_offset) * layer._c8_k_scale
                 value = (value.to(query.dtype) - layer._c8_v_offset) * layer._c8_v_scale
 
+        value = value.contiguous()
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
