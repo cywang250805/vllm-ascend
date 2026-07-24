@@ -4989,7 +4989,7 @@ class NPUModelRunner(GPUModelRunner):
                             num_kv_heads=spec.num_kv_heads,
                             head_size=spec.head_size,
                             head_size_v=spec.head_size_v,
-                            dtype=spec.dtype,
+                            dtype=torch.float8_e4m3fn,
                             kv_quant_mode=spec.kv_quant_mode,
                             page_size_padded=spec.page_size_padded,
                             sliding_window=spec.sliding_window,

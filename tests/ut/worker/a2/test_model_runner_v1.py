@@ -160,7 +160,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             num_kv_heads=2,
             head_size=64,
             head_size_v=32,
-            dtype=torch.float8_e4m3fn,
+            dtype=torch.uint8,
             sliding_window=4096,
             attention_chunk_size=2048,
         )
@@ -180,7 +180,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(converted_spec.num_kv_heads, source_spec.num_kv_heads)
         self.assertEqual(converted_spec.head_size, source_spec.head_size)
         self.assertEqual(converted_spec.head_size_v, source_spec.head_size_v)
-        self.assertEqual(converted_spec.dtype, source_spec.dtype)
+        self.assertEqual(source_spec.dtype, torch.uint8)
+        self.assertEqual(converted_spec.dtype, torch.float8_e4m3fn)
         self.assertEqual(converted_spec.kv_quant_mode, source_spec.kv_quant_mode)
         self.assertEqual(converted_spec.page_size_padded, source_spec.page_size_padded)
         self.assertEqual(converted_spec.sliding_window, source_spec.sliding_window)
