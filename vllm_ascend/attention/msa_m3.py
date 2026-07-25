@@ -56,6 +56,10 @@ from vllm_ascend.attention.msa_m3_ops import (
     minimax_m3_sparse_attn_torch as minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode_torch as minimax_m3_sparse_attn_decode,
 )
+from vllm_ascend.gqa_kv_fp8_debug import (
+    claim_gqa_kv_fp8_debug_event,
+    log_gqa_kv_fp8,
+)
 import vllm_ascend.ops.minimax_m3_sparse  # noqa: F401
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
@@ -64,6 +68,15 @@ from vllm_ascend.ops.linear_op import get_parallel_op
 logger = init_logger(__name__)
 
 _SPARSE_ATTN_LOGGED = False
+
+
+def _resolve_minimax_m3_sparse_kv_cache_dtype(
+    requested_kv_cache_dtype: str,
+) -> str:
+    """Keep MiniMax M3 sparse KV cache unquantized until FP8 is supported."""
+    if requested_kv_cache_dtype.startswith("fp8"):
+        return "bfloat16"
+    return requested_kv_cache_dtype
 
 
 def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:
@@ -1111,8 +1124,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
-        self.kv_cache_dtype = (
+        self.requested_kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
+        )
+        self.kv_cache_dtype = _resolve_minimax_m3_sparse_kv_cache_dtype(
+            self.requested_kv_cache_dtype
         )
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
@@ -1195,13 +1211,41 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        DeviceOperator.reshape_and_cache(
-            k_insert,
-            v_insert,
-            key_cache,
-            value_cache,
-            main_meta.slot_mapping[:num_tokens],
-        )
+        if claim_gqa_kv_fp8_debug_event(
+            f"sparse_cache_insert:{self.layer_name}"
+        ):
+            log_gqa_kv_fp8(
+                "event=sparse_cache_insert; "
+                f"layer={self.layer_name}, "
+                f"requested_cache_dtype={self.requested_kv_cache_dtype!r}, "
+                f"effective_cache_dtype={self.kv_cache_dtype!r}, "
+                f"effective_torch_dtype={self.kv_cache_torch_dtype}, "
+                f"key_input={tuple(k_insert.shape)}/{k_insert.dtype}, "
+                f"value_input={tuple(v_insert.shape)}/{v_insert.dtype}, "
+                f"key_cache={tuple(key_cache.shape)}/{key_cache.dtype}, "
+                f"value_cache={tuple(value_cache.shape)}/{value_cache.dtype}."
+            )
+        try:
+            DeviceOperator.reshape_and_cache(
+                k_insert,
+                v_insert,
+                key_cache,
+                value_cache,
+                main_meta.slot_mapping[:num_tokens],
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "event=sparse_cache_insert_error; "
+                "MiniMaxM3SparseAttention KV-cache insertion failed: "
+                f"layer={self.layer_name}, "
+                f"requested_cache_dtype={self.requested_kv_cache_dtype!r}, "
+                f"effective_cache_dtype={self.kv_cache_dtype!r}, "
+                f"effective_torch_dtype={self.kv_cache_torch_dtype}, "
+                f"key_input={tuple(k_insert.shape)}/{k_insert.dtype}, "
+                f"value_input={tuple(v_insert.shape)}/{v_insert.dtype}, "
+                f"key_cache={tuple(key_cache.shape)}/{key_cache.dtype}, "
+                f"value_cache={tuple(value_cache.shape)}/{value_cache.dtype}."
+            ) from exc
 
         idx_cache = self.indexer.index_cache.kv_cache
         if isinstance(idx_cache, (tuple, list)):

@@ -4475,7 +4475,8 @@ class NPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache)
                         log_gqa_kv_fp8_once(
                             "cache_allocation",
-                            "allocated a three-tensor dense cache and included k_scale_cache in page_size: "
+                            "event=cache_allocation; allocated a three-tensor dense cache "
+                            "and included k_scale_cache in page_size: "
                             f"layer={layer_name}, num_blocks={num_blocks}, "
                             f"page_bytes={current_kv_cache_spec.page_size_bytes} "
                             f"(K={current_kv_cache_spec.k_page_size_bytes}, "
@@ -4958,6 +4959,38 @@ class NPUModelRunner(GPUModelRunner):
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
         for layer_name, attn_module in attn_layers.items():
+            is_attention = isinstance(attn_module, Attention)
+            dense_gqa_marker = getattr(
+                attn_module,
+                "_ascend_minimax_m3_dense_gqa",
+                None,
+            )
+            cache_dtype = str(self.vllm_config.cache_config.cache_dtype)
+            uses_supported_fp8_cache = cache_dtype in ("fp8", "fp8_e4m3")
+            if is_attention and bool(dense_gqa_marker):
+                cache_layer_kind = "dense_gqa"
+            elif isinstance(attn_module, MiniMaxM3SparseAttention):
+                cache_layer_kind = "sparse_attention"
+            elif isinstance(attn_module, AscendMiniMaxM3IndexerCache):
+                cache_layer_kind = "indexer"
+            else:
+                cache_layer_kind = "other"
+            log_gqa_kv_fp8_once(
+                f"kv_cache_spec_conditions:{layer_name}",
+                "event=cache_spec_conditions; "
+                f"layer={layer_name}, "
+                f"layer_kind={cache_layer_kind}, "
+                f"module_type={type(attn_module).__module__}."
+                f"{type(attn_module).__qualname__}, "
+                f"condition_1_is_Attention={is_attention}, "
+                "condition_2_dense_gqa_marker="
+                f"{dense_gqa_marker!r} "
+                f"(bool={bool(dense_gqa_marker)}), "
+                f"condition_3_cache_dtype={cache_dtype!r} "
+                f"(supported={uses_supported_fp8_cache}), "
+                f"all_conditions={is_attention and bool(dense_gqa_marker) and uses_supported_fp8_cache}, "
+                f"use_compress={self.use_compress}.",
+            )
             if (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
                 # The layer doesn't need its own KV cache and will use that of
@@ -4978,10 +5011,11 @@ class NPUModelRunner(GPUModelRunner):
                 (Attention, MiniMaxM3SparseAttention, AscendMiniMaxM3IndexerCache),
             ):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    source_spec = spec
                     if (
-                        isinstance(attn_module, Attention)
-                        and getattr(attn_module, "_ascend_minimax_m3_dense_gqa", False)
-                        and str(self.vllm_config.cache_config.cache_dtype) in ("fp8", "fp8_e4m3")
+                        is_attention
+                        and bool(dense_gqa_marker)
+                        and uses_supported_fp8_cache
                     ):
                         assert isinstance(spec, FullAttentionSpec)
                         spec = AscendGQAFp8AttentionSpec(
@@ -4995,6 +5029,24 @@ class NPUModelRunner(GPUModelRunner):
                             sliding_window=spec.sliding_window,
                             attention_chunk_size=spec.attention_chunk_size,
                         )
+                    log_gqa_kv_fp8_once(
+                        f"kv_cache_spec_result:{layer_name}",
+                        "event=cache_spec_result; "
+                        f"layer={layer_name}, "
+                        f"layer_kind={cache_layer_kind}, "
+                        f"requested_cache_dtype={getattr(attn_module, 'requested_kv_cache_dtype', cache_dtype)!r}, "
+                        f"effective_cache_dtype={getattr(attn_module, 'kv_cache_dtype', None)!r}, "
+                        f"effective_torch_dtype={getattr(attn_module, 'kv_cache_torch_dtype', None)}, "
+                        f"source_spec={type(source_spec).__module__}."
+                        f"{type(source_spec).__qualname__}, "
+                        f"source_dtype={source_spec.dtype}, "
+                        f"source_kv_quant_mode={source_spec.kv_quant_mode}, "
+                        f"selected_spec={type(spec).__module__}.{type(spec).__qualname__}, "
+                        f"selected_dtype={spec.dtype}, "
+                        f"selected_kv_quant_mode={spec.kv_quant_mode}, "
+                        "gqa_fp8_spec_active="
+                        f"{isinstance(spec, AscendGQAFp8AttentionSpec)}.",
+                    )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 

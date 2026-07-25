@@ -5,8 +5,19 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from vllm.model_executor.layers.attention import Attention, MLAAttention
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    KVQuantMode,
+)
 
+from vllm_ascend.attention.msa_m3 import (
+    AscendMiniMaxM3IndexerCache,
+    MiniMaxM3SparseAttention,
+    _resolve_minimax_m3_sparse_kv_cache_dtype,
+)
 from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -194,6 +205,99 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             converted_spec.k_page_size_bytes
             + converted_spec.v_page_size_bytes
             + converted_spec.k_scale_page_size_bytes,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_minimax_m3_global_fp8_routes_cache_dtypes_per_layer(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.shared_kv_cache_layers = {}
+        runner.vllm_config.cache_config.cache_dtype = "fp8"
+        runner.vllm_config.cache_config.block_size = 16
+
+        dense_source_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=64,
+            head_size_v=64,
+            dtype=torch.uint8,
+            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        )
+        dense_attn = Attention.__new__(Attention)
+        torch.nn.Module.__init__(dense_attn)
+        dense_attn.kv_sharing_target_layer_name = None
+        dense_attn._ascend_minimax_m3_dense_gqa = True
+        dense_attn.get_kv_cache_spec = MagicMock(return_value=dense_source_spec)
+
+        sparse_attn = MiniMaxM3SparseAttention.__new__(MiniMaxM3SparseAttention)
+        torch.nn.Module.__init__(sparse_attn)
+        sparse_attn.num_kv_heads = 2
+        sparse_attn.head_dim = 64
+        sparse_attn.requested_kv_cache_dtype = "fp8"
+        sparse_attn.kv_cache_dtype = _resolve_minimax_m3_sparse_kv_cache_dtype(
+            sparse_attn.requested_kv_cache_dtype
+        )
+        sparse_attn.kv_cache_torch_dtype = torch.bfloat16
+        sparse_attn.impl = SimpleNamespace(
+            kv_cache_dtype=sparse_attn.kv_cache_dtype
+        )
+
+        indexer_cache = AscendMiniMaxM3IndexerCache.__new__(
+            AscendMiniMaxM3IndexerCache
+        )
+        torch.nn.Module.__init__(indexer_cache)
+        indexer_cache.head_dim = 64
+        indexer_cache.dtype = torch.bfloat16
+
+        dense_layer = "model.layers.0.self_attn.attn"
+        sparse_layer = "model.layers.1.self_attn.attn"
+        indexer_layer = f"{sparse_layer}.indexer"
+        mock_get_layers.return_value = {
+            dense_layer: dense_attn,
+            sparse_layer: sparse_attn,
+            indexer_layer: indexer_cache,
+        }
+
+        specs = runner.get_kv_cache_spec()
+
+        self.assertIsInstance(specs[dense_layer], AscendGQAFp8AttentionSpec)
+        self.assertEqual(specs[dense_layer].dtype, torch.float8_e4m3fn)
+        self.assertEqual(
+            specs[dense_layer].kv_quant_mode,
+            KVQuantMode.FP8_PER_TENSOR,
+        )
+
+        self.assertIsInstance(specs[sparse_layer], FullAttentionSpec)
+        self.assertNotIsInstance(
+            specs[sparse_layer],
+            AscendGQAFp8AttentionSpec,
+        )
+        self.assertEqual(sparse_attn.requested_kv_cache_dtype, "fp8")
+        self.assertEqual(sparse_attn.kv_cache_dtype, "bfloat16")
+        self.assertEqual(sparse_attn.impl.kv_cache_dtype, "bfloat16")
+        self.assertEqual(specs[sparse_layer].dtype, torch.bfloat16)
+        self.assertEqual(specs[sparse_layer].kv_quant_mode, KVQuantMode.NONE)
+
+        self.assertIsInstance(specs[indexer_layer], FullAttentionSpec)
+        self.assertEqual(specs[indexer_layer].dtype, torch.bfloat16)
+        self.assertEqual(specs[indexer_layer].kv_quant_mode, KVQuantMode.NONE)
+
+    def test_minimax_m3_sparse_cache_falls_back_for_all_fp8_aliases(self):
+        self.assertEqual(
+            _resolve_minimax_m3_sparse_kv_cache_dtype("fp8"),
+            "bfloat16",
+        )
+        self.assertEqual(
+            _resolve_minimax_m3_sparse_kv_cache_dtype("fp8_e4m3"),
+            "bfloat16",
+        )
+        self.assertEqual(
+            _resolve_minimax_m3_sparse_kv_cache_dtype("auto"),
+            "auto",
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
