@@ -69,6 +69,7 @@ from vllm_ascend.gqa_kv_fp8_debug import (
     claim_gqa_kv_fp8_debug_event,
     log_gqa_kv_fp8,
 )
+from vllm_ascend import fia_dump
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.scatter_pa_kv_cache_with_k_scale import scatter_pa_kv_cache_with_k_scale
@@ -451,6 +452,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+        self._fia_layer_name: str = ""
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -1368,6 +1370,37 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dequant_scale_value_dtype=torch.float32,
             return_softmax_lse=False,
         )
+        if fia_dump.should_dump(self._fia_layer_name):
+            fia_dump.save_fia_io(
+                "fp8",
+                self._fia_layer_name,
+                inputs={
+                    "query": query,
+                    "key": key,
+                    "value": value,
+                    "dequant_scale_query": q_scale,
+                    "dequant_scale_key": k_scale,
+                    "dequant_scale_value": v_scale,
+                    "quant_scale_p": p_scale,
+                    "atten_mask": attn_metadata.attn_mask,
+                    "block_table": block_table,
+                    "actual_seq_qlen": attn_metadata.actual_seq_lengths_q,
+                    "actual_seq_kvlen": actual_seq_lengths_kv,
+                },
+                output=attn_output,
+                meta={
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_size": self.head_size,
+                    "scale": self.scale,
+                    "block_size": block_size,
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "attn_state": str(attn_metadata.attn_state),
+                    "input_layout": "NTD_TND",
+                    "softmax_scale": self.scale,
+                    "out_dtype": output.dtype,
+                },
+            )
         if claim_gqa_kv_fp8_debug_event("fia_output"):
             try:
                 output_sample = (
@@ -1404,6 +1437,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         assert self.key_cache is not None
         assert self.value_cache is not None
         assert self.k_scale_cache is not None
+
+        if fia_dump.should_dump(self._fia_layer_name):
+            fia_dump.save_fia_io(
+                "fp8_kv",
+                self._fia_layer_name,
+                inputs={"key": key, "value": value, "slot_mapping": slot_mapping},
+                output=None,
+                meta={
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_size": self.head_size,
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "note": "direct bf16 K/V before fp8 quantization",
+                },
+            )
 
         key = key.clamp(
             min=-FP8_E4M3_MAX,
@@ -1597,6 +1645,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if fia_dump.should_dump(self._fia_layer_name):
+            fia_dump.save_fia_io(
+                "bf16",
+                self._fia_layer_name,
+                inputs={
+                    "query": query,
+                    "key": key,
+                    "value": value,
+                    "atten_mask": attn_metadata.attn_mask,
+                    "block_table": block_table,
+                    "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                    "actual_seq_lengths_kv": actual_seq_lengths_kv,
+                },
+                output=attn_output,
+                meta={
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_size": self.head_size,
+                    "scale": self.scale,
+                    "block_size": block_size,
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "attn_state": str(attn_metadata.attn_state),
+                    "sliding_window": self.sliding_window,
+                    "causal": attn_metadata.causal,
+                },
+            )
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1756,6 +1830,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        self._fia_layer_name = layer.layer_name
         if self.enable_hamming_sparse:
             self.layerIndex = int(layer.layer_name.split(".")[2])
         if self._use_layer_aware_fia_graph_replay:
