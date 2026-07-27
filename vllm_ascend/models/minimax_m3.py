@@ -274,7 +274,7 @@ class MiniMaxM3MoE(nn.Module):
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
             )
-            
+
             self.e_score_correction_bias.weight_loader = (
                 MiniMaxM3MoE.ebias_weight_loader
             )
@@ -431,6 +431,9 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        # Used by the model runner to add a K-scale cache only to the dense
+        # GQA layers. MiniMax M3 sparse-attention caches remain unchanged.
+        self.attn._ascend_minimax_m3_dense_gqa = True
 
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -453,7 +456,7 @@ class MiniMaxM3Attention(nn.Module):
         q, k = self._qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -581,7 +584,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
-  
+
         # logger.error(f" ====>outxx COUNT {_LAYER_IDX}, hidden_states shape : {hidden_states.shape}, l1_norm : {torch.norm(hidden_states.float(), p=1)}" )
         # if residual is not None:
         #     logger.error(f" ====>outxx COUNT {_LAYER_IDX}, residual shape : {residual.shape}, l1_norm : {torch.norm(residual.float(), p=1)}" )
@@ -930,7 +933,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
             )
         else:
             self.lm_head = PPMissingLayer()
-        
+
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
         self.make_empty_intermediate_tensors = (
