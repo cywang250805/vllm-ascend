@@ -80,6 +80,7 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 SWA_INT_MAX = 2147483647
 FP8_E4M3_MAX = 448.0
 _ATTN_KEYS_BUFFER = None
+_FIA_FP8_V2_MARKER = "fp8_v2"
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -722,6 +723,82 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     handles,
                     events,
                 ):
+                    if param[-1] == _FIA_FP8_V2_MARKER:
+                        (
+                            query,
+                            key_cache,
+                            value_cache,
+                            block_tables,
+                            attn_mask,
+                            block_size,
+                            seq_lens,
+                            actual_seq_lengths_q,
+                            num_kv_heads,
+                            num_heads,
+                            scale,
+                            attn_output,
+                            softmax_lse,
+                            q_scale,
+                            k_scale,
+                            v_scale,
+                            p_scale,
+                            query_quant_mode,
+                            key_quant_mode,
+                            value_quant_mode,
+                            layer_name,
+                            _marker,
+                        ) = param
+
+                        if _EXTRA_CTX.is_draft_model:
+                            draft_step, key = draft_attn_key_steps[attn_count]
+                            metadata = attn_metadata[draft_step][key]
+                            seq_lens = metadata.seq_lens_list
+                            actual_seq_lengths_q = metadata.actual_seq_lengths_q
+                            block_tables = metadata.block_tables
+                            attn_count = attn_count + 1
+                        else:
+                            metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
+                            seq_lens = attn_metadata[metadata_key].seq_lens_list
+                            actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
+                            if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
+                                block_tables = attn_metadata[metadata_key].block_tables
+
+                        torch.npu.graph_task_update_begin(update_stream, handle)
+                        torch_npu.npu_fused_infer_attention_score_v2.out(
+                            query=query,
+                            key=key_cache,
+                            value=value_cache,
+                            block_table=block_tables,
+                            atten_mask=attn_mask,
+                            input_layout="NTD_TND",
+                            block_size=block_size,
+                            actual_seq_qlen=actual_seq_lengths_q,
+                            actual_seq_kvlen=seq_lens,
+                            num_key_value_heads=num_kv_heads,
+                            num_query_heads=num_heads,
+                            dequant_scale_query=q_scale,
+                            dequant_scale_key=k_scale,
+                            dequant_scale_value=v_scale,
+                            quant_scale_p=p_scale,
+                            softmax_scale=scale,
+                            sparse_mode=3,
+                            query_quant_mode=query_quant_mode,
+                            key_quant_mode=key_quant_mode,
+                            value_quant_mode=value_quant_mode,
+                            query_dtype=torch.float8_e4m3fn,
+                            key_dtype=torch.float8_e4m3fn,
+                            value_dtype=torch.float8_e4m3fn,
+                            dequant_scale_query_dtype=torch.float32,
+                            dequant_scale_key_dtype=torch.float32,
+                            dequant_scale_value_dtype=torch.float32,
+                            out_dtype=attn_output.dtype,
+                            workspace=workspace,
+                            out=[attn_output, softmax_lse],
+                        )
+                        torch.npu.graph_task_update_end(update_stream)
+                        event.record(update_stream)
+                        continue
+
                     (
                         query,
                         key_cache,
@@ -1109,6 +1186,146 @@ class AscendAttentionBackendImpl(AttentionImpl):
             next_tokens=0,
             softmax_scale=self.scale,
             learnable_sink=self.sinks,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
+        return output, num_tokens
+
+    def full_graph_fia_fp8(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        (
+            key_cache,
+            value_cache,
+            k_scale,
+            block_size,
+            block_table,
+            actual_seq_lengths_kv,
+        ) = self._get_fia_fp8_params(attn_metadata)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        if _EXTRA_CTX.is_draft_model:
+            graph_params = get_draft_graph_params()
+        else:
+            graph_params = get_graph_params()
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+
+        query_fp8 = (
+            query[:num_tokens]
+            .clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
+            .to(torch.float8_e4m3fn)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        q_scale = torch.ones(
+            (self.num_heads, num_tokens),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        v_scale = torch.ones(
+            self.num_kv_heads,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        p_scale = torch.ones(1, dtype=torch.float32, device=query.device)
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        query_quant_mode = 3
+        key_quant_mode = 3
+        value_quant_mode = 2
+
+        fp8_v2_kwargs = dict(
+            query=query_fp8,
+            key=key_cache,
+            value=value_cache,
+            atten_mask=attn_metadata.attn_mask,
+            actual_seq_qlen=actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            dequant_scale_query=q_scale,
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            block_table=block_table,
+            block_size=block_size,
+            num_query_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+            input_layout="NTD_TND",
+            sparse_mode=3,
+            quant_scale_p=p_scale,
+            out_dtype=output.dtype,
+            query_quant_mode=query_quant_mode,
+            key_quant_mode=key_quant_mode,
+            value_quant_mode=value_quant_mode,
+            query_dtype=torch.float8_e4m3fn,
+            key_dtype=torch.float8_e4m3fn,
+            value_dtype=torch.float8_e4m3fn,
+            dequant_scale_query_dtype=torch.float32,
+            dequant_scale_key_dtype=torch.float32,
+            dequant_scale_value_dtype=torch.float32,
+        )
+
+        use_max_workspace = self._use_max_workspace_for_fia_graph
+        workspace = graph_params.workspaces.get(num_tokens)
+        should_update_workspace_cache = False
+        if use_max_workspace or workspace is None:
+            candidate_workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                **fp8_v2_kwargs,
+            )
+            workspace = cache_graph_workspace(
+                graph_params,
+                num_tokens,
+                candidate_workspace,
+                use_max_workspace=use_max_workspace,
+            )
+            should_update_workspace_cache = True
+        if should_update_workspace_cache:
+            if _EXTRA_CTX.is_draft_model:
+                update_draft_graph_params_workspaces(num_tokens, workspace)
+            else:
+                update_graph_params_workspaces(num_tokens, workspace)
+
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+
+        layer_name = self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None
+        graph_params.attn_params[num_tokens].append(
+            (
+                weak_ref_tensors(query_fp8),
+                weak_ref_tensors(key_cache),
+                weak_ref_tensors(value_cache),
+                weak_ref_tensors(block_table),
+                weak_ref_tensors(attn_metadata.attn_mask) if attn_metadata.attn_mask is not None else None,
+                block_size,
+                actual_seq_lengths_kv,
+                actual_seq_lengths_q,
+                self.num_kv_heads,
+                self.num_heads,
+                self.scale,
+                weak_ref_tensors(output),
+                weak_ref_tensors(softmax_lse),
+                weak_ref_tensors(q_scale),
+                weak_ref_tensors(k_scale),
+                weak_ref_tensors(v_scale),
+                weak_ref_tensors(p_scale),
+                query_quant_mode,
+                key_quant_mode,
+                value_quant_mode,
+                layer_name,
+                _FIA_FP8_V2_MARKER,
+            )
+        )
+
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            **fp8_v2_kwargs,
             workspace=workspace,
             out=[output, softmax_lse],
         )
@@ -1529,6 +1746,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
+            if self.k_scale_cache is not None:
+                attn_output, num_tokens = self.full_graph_fia_fp8(
+                    query, key, value, attn_metadata, output
+                )
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
