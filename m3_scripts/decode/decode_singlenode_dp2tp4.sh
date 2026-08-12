@@ -20,9 +20,17 @@ export TASK_QUEUE_ENABLE=1
 export VLLM_TORCH_PROFILER_DIR="/home/z00946994/profiling"
 export VLLM_TORCH_PROFILER_WITH_STACK=0
 export ASCEND_LAUNCH_BLOCKING=0
-# for sparse attention
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.T560/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
-export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-9.1.T560/opp/vendors/custom_transformer/op_api/lib/:$ASCEND_CUSTOM_OPP_PATH
+# Load the same custom-operator package that was installed and validated by
+# msa_simple_example.py. ASCEND_CUSTOM_OPP_PATH must point to the vendor root;
+# the aclnn loader appends /op_api/lib/libcust_opapi.so itself.
+custom_transformer_root="/home/w00943508/minimax-m3/gqa-fp8-0812/package/package_custom_d7ddd7/vendors/custom_transformer"
+if [ ! -f "${custom_transformer_root}/bin/set_env.bash" ] || \
+   [ ! -f "${custom_transformer_root}/op_api/lib/libcust_opapi.so" ]; then
+    echo "DenseAttentionScore custom operator is not installed under ${custom_transformer_root}" >&2
+    exit 1
+fi
+source /usr/local/Ascend/cann/set_env.sh
+source "${custom_transformer_root}/bin/set_env.bash"
 export PATH=/home/g00893696/ascendnpu-ir/tools/bishengir/bin:$PATH
 
 # flash_comm
