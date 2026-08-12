@@ -63,7 +63,6 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
-from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
@@ -212,6 +211,19 @@ class AscendMetadata:
     reshape_cache_event: torch.npu.Event = None
 
     kvcomp_metadata: KVCompMetaData | None = None
+    # Persistent device-side metadata used by DenseAttentionScore during ACL
+    # graph capture/replay.  These views point at model-runner buffers whose
+    # contents are refreshed before every replay.
+    _dense_query_start_loc: torch.Tensor | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _dense_seq_lens: torch.Tensor | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _dense_attention_score_runtime_metadata: tuple[object, ...] | None = field(
         default=None,
         init=False,
@@ -274,10 +286,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     ) -> AttentionCGSupport:
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
-        if isinstance(kv_cache_spec, AscendGQAFp8AttentionSpec):
-            # DenseAttentionScore currently has no graph-task workspace/out
-            # replay API.
-            return AttentionCGSupport.NEVER
         return AttentionCGSupport.ALWAYS
 
     def reorder_batch(self, input_batch, scheduler_output: "SchedulerOutput") -> bool:
@@ -378,6 +386,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            _dense_query_start_loc=common_attn_metadata.query_start_loc[: num_reqs + 1],
+            _dense_seq_lens=(
+                common_attn_metadata.seq_lens[:num_reqs] if common_attn_metadata.seq_lens is not None else None
+            ),
         )
         return attn_metadata
 
@@ -1259,8 +1271,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_lengths_kv = attn_metadata.seq_lens_list
         if block_table is not None and actual_seq_lengths_kv:
             block_table = block_table[: len(actual_seq_lengths_kv)]
-            max_num_blocks = cdiv(max(actual_seq_lengths_kv), block_size)
-            block_table = block_table[:, :max_num_blocks]
+            if not _EXTRA_CTX.capturing:
+                max_num_blocks = cdiv(max(actual_seq_lengths_kv), block_size)
+                block_table = block_table[:, :max_num_blocks]
 
         return (
             self.key_cache,
@@ -1332,6 +1345,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv_tensor,
         )
 
+    @staticmethod
+    def _get_dense_attention_score_graph_metadata(
+        attn_metadata: AscendMetadata,
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_start_loc = attn_metadata._dense_query_start_loc
+        seq_lens = attn_metadata._dense_seq_lens
+        if query_start_loc is None or seq_lens is None:
+            raise RuntimeError(
+                "DenseAttentionScore ACL graph capture requires persistent "
+                "device query_start_loc and seq_lens metadata."
+            )
+
+        # Unlike FIA, DenseAttentionScore consumes device tensors for dynamic
+        # sequence lengths.  Record these tensor operations in the ACL graph so
+        # replay observes the model runner's freshly updated persistent buffers.
+        actual_seq_lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int32).contiguous()
+        actual_seq_lengths_kv = seq_lens.to(torch.int32)
+        # Graph padding creates decode requests with Q length 1 and KV length 0.
+        # Give those dummy rows a valid length without changing real requests.
+        actual_seq_lengths_kv = torch.maximum(actual_seq_lengths_kv, actual_seq_lengths).contiguous()
+        return block_table.contiguous(), actual_seq_lengths, actual_seq_lengths_kv
+
     def _forward_dense_attention_score_fp8(
         self,
         query: torch.Tensor,
@@ -1378,17 +1414,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         q_dequant_scale = self._fp8_scale_cache_view((batch_size, self.num_heads, max_q_blocks, 1))
         k_dequant_scale = self._fp8_scale_cache_view((batch_size, self.num_kv_heads, max_kv_blocks, 1))
         v_dequant_scale = k_dequant_scale
-        (
-            block_table,
-            actual_seq_lengths,
-            actual_seq_lengths_kv,
-        ) = self._get_dense_attention_score_runtime_metadata(
-            attn_metadata,
-            block_table,
-            actual_seq_lengths,
-            actual_seq_lengths_kv,
-            query.device,
-        )
+        if _EXTRA_CTX.capturing:
+            (
+                block_table,
+                actual_seq_lengths,
+                actual_seq_lengths_kv,
+            ) = self._get_dense_attention_score_graph_metadata(
+                attn_metadata,
+                block_table,
+            )
+        else:
+            (
+                block_table,
+                actual_seq_lengths,
+                actual_seq_lengths_kv,
+            ) = self._get_dense_attention_score_runtime_metadata(
+                attn_metadata,
+                block_table,
+                actual_seq_lengths,
+                actual_seq_lengths_kv,
+                query.device,
+            )
 
         dense_attention_op = getattr(torch_npu, "npu_dense_attention_score", None)
         if dense_attention_op is None:
@@ -1473,7 +1519,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
             if self.k_scale_cache is not None:
-                raise RuntimeError("MiniMax M3 DenseAttentionScore FP8 attention does not support ACL graph capture.")
+                return self._forward_dense_attention_score_fp8(query, attn_metadata, output)
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]

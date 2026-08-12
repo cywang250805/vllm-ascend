@@ -387,6 +387,50 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertEqual(kwargs["attention_out_dtype"], torch.bfloat16)
         self.assertTrue(torch.equal(result, dense_output.permute(1, 0, 2)))
 
+    @patch(
+        "vllm_ascend.attention.attention_v1.torch_npu.npu_dense_attention_score",
+        create=True,
+    )
+    def test_dense_attention_score_graph_uses_persistent_device_metadata(self, mock_dense_attention):
+        self.impl.key_cache = torch.empty(
+            (2, 8, 16, 64),
+            dtype=torch.float8_e4m3fn,
+        )
+        self.impl.value_cache = torch.empty_like(self.impl.key_cache)
+        self.impl.k_scale_cache = torch.ones(
+            (2, 8, 16, 1),
+            dtype=torch.float32,
+        )
+        mock_dense_attention.return_value = torch.zeros((8, 2, 64), dtype=torch.bfloat16)
+        block_tables = torch.tensor(
+            [[0, 1, 0, 1], [1, 0, 1, 0], [0, 0, 0, 0]],
+            dtype=torch.int32,
+        )
+        metadata = SimpleNamespace(
+            actual_seq_lengths_q=[1, 2],
+            seq_lens_list=[17, 20],
+            block_tables=block_tables,
+            _dense_query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            _dense_seq_lens=torch.tensor([17, 0], dtype=torch.int32),
+            attn_state=AscendAttentionState.DecodeOnly,
+            attn_mask=None,
+        )
+
+        with patch.object(attn_module._EXTRA_CTX, "capturing", True):
+            self.impl._forward_dense_attention_score_fp8(
+                torch.zeros((2, 8, 64), dtype=torch.bfloat16),
+                metadata,
+                torch.empty((2, 8, 64), dtype=torch.bfloat16),
+            )
+
+        args = mock_dense_attention.call_args.args
+        kwargs = mock_dense_attention.call_args.kwargs
+        self.assertEqual(args[3].shape, (2, 4))
+        self.assertTrue(torch.equal(kwargs["actual_seq_lengths"], torch.tensor([1, 1], dtype=torch.int32)))
+        # The padded graph row has KV length zero in the runner buffer; it is
+        # normalized to its Q length so the custom op receives valid metadata.
+        self.assertTrue(torch.equal(kwargs["actual_seq_lengths_kv"], torch.tensor([17, 1], dtype=torch.int32)))
+
     def test_dense_attention_score_rejects_mismatched_batch_lengths(self):
         self.impl.key_cache = torch.empty(
             (2, 8, 16, 64),

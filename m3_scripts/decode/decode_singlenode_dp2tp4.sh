@@ -57,7 +57,7 @@ vllm serve /home/g00893696/weight/MiniMax-M3-MXFP8/  \
      --kv-cache-dtype fp8 \
      --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
      --safetensors-load-strategy 'prefetch' \
-     --additional-config '{"enable_cpu_binding":true,"ascend_compilation_config":{"fuse_qknorm_rope":false, "fuse_norm_quant":false}, "indexer_kv_dtype": "fp8", "multistream_overlap_shared_expert": true}' \
+     --additional-config '{"enable_cpu_binding":true,"enable_gqa_kv_cache_fp8":true,"ascend_compilation_config":{"fuse_qknorm_rope":false, "fuse_norm_quant":false}, "indexer_kv_dtype": "fp8", "multistream_overlap_shared_expert": true}' \
      --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/x30075441/prof/minimax_486t_deocde_sp_score_fp8_729", "torch_profiler_with_stack": false}' \
      > decode_log/minimax_486t_decode_128k_bs8_0724_force3.log 2>&1 &
 
