@@ -625,6 +625,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             raise ValueError("DSA metadata builder requires at least one layer name")
         # vLLM assigns one builder result to every layer in an attention group.
         self.cache_group_key = layer_names[0]
+        # KV-cache layers use .swa_cache, while RoPE is registered by .attn.
+        self.rope_layer_names = [
+            name.removesuffix(".swa_cache") + ".attn" if name.endswith(".swa_cache") else name for name in layer_names
+        ]
         hf_config = self.model_config.hf_config
 
         if AscendDSAMetadataBuilder.hadamard is None:
@@ -1165,7 +1169,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.decode_ratio_to_sas_metadata["query_start_loc"] = query_start_loc
             input_positions = common_attn_metadata.positions[: self.num_decode_tokens].long()
             self.decode_ratio_to_sas_metadata["input_positions"] = input_positions
-            cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
+            if self.num_prefills == 0:
+                # Common metadata has already populated the same cached
+                # positions, including graph padding. Keep the decode view
+                # limited to its token count without another device lookup.
+                cos = self.common_ratio_to_sas_metadata["cos"][: self.num_decode_tokens]
+                sin = self.common_ratio_to_sas_metadata["sin"][: self.num_decode_tokens]
+            else:
+                cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
             self.decode_ratio_to_sas_metadata["cos"] = cos
             self.decode_ratio_to_sas_metadata["sin"] = sin
 
@@ -1424,11 +1435,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_input_tokens = common_attn_metadata.num_input_tokens
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
         if num_prefills:
-            cos, sin = get_cos_and_sin_dsa(input_positions)
+            cos, sin = get_cos_and_sin_dsa(input_positions, layer_names=self.rope_layer_names)
         else:
             # disable use_cache, otherwise, draft_index>0 will override draft_index=0
             # take care of this, if full graph is needed then rope cache is inevitable
-            cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
+            cos, sin = get_cos_and_sin_dsa(
+                input_positions, use_cache=True, draft_index=draft_index, layer_names=self.rope_layer_names
+            )
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(  # type: ignore[index]
@@ -1452,6 +1465,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 common_attn_metadata=common_attn_metadata,
                 num_decodes=num_decodes,
                 num_decode_tokens=num_decode_tokens,
+                rope=(cos, sin) if num_prefills == 0 else None,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -1495,7 +1509,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         input_positions = common_attn_metadata.positions[:num_actual_tokens].long()
         prefill_input_positions = input_positions[tokens_start:]
-        cos, sin = get_cos_and_sin_dsa(prefill_input_positions)
+        cos, sin = get_cos_and_sin_dsa(prefill_input_positions, layer_names=self.rope_layer_names)
 
         assert num_prefill_tokens is not None
         prefill_slot_mapping = self.spec_slot_mapping[draft_index - 1][tokens_start : tokens_start + num_prefill_tokens]  # type: ignore[index]
@@ -1582,7 +1596,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         input_positions = common_attn_metadata.positions[:num_decode_tokens_typed].long()
         # disable use_cache, otherwise, draft_index>0 will override draft_index=0
         # take care of this, if full graph is needed then rope cache is inevitable
-        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
+        rope = kwargs.get("rope")
+        if rope is not None:
+            cos, sin = (proxy[:num_decode_tokens_typed] for proxy in rope)
+        else:
+            cos, sin = get_cos_and_sin_dsa(
+                input_positions, use_cache=True, draft_index=draft_index, layer_names=self.rope_layer_names
+            )
 
         slot_mapping = self.spec_slot_mapping[draft_index - 1][:num_decode_tokens_typed]  # type: ignore[index]
         dspark_swa_indices = None

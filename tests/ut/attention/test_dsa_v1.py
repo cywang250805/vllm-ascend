@@ -49,6 +49,7 @@ def _make_dspark_draft_builder(max_num_tokens: int = 16):
     builder._device_metadata_tasks = ()
     builder.dspark_swa_indices_buffer = None
     builder.cache_group_key = "draft"
+    builder.rope_layer_names = ["mtp.0.self_attn.attn"]
     builder.enable_dspark_device_metadata(max_num_tokens)
     return builder
 

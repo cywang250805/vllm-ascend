@@ -38,7 +38,7 @@ from vllm_ascend.models.deepseek_v4 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV4MoE,
 )
-from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 from vllm_ascend.utils import enable_dsa_cp
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.scale$")
@@ -50,9 +50,10 @@ def _apply_dsv4_rope(
     x: torch.Tensor,
     *,
     inverse: bool = False,
+    rope: tuple[RopeDataProxy, RopeDataProxy] | None = None,
 ) -> torch.Tensor:
-    cos, sin = get_cos_and_sin_dsa(positions)
     layer_name = rotary_emb.layername
+    cos, sin = get_cos_and_sin_dsa(positions, layer_names=[layer_name]) if rope is None else rope
     cos_t = cos[layer_name]
     sin_t = sin[layer_name]
     if inverse:
@@ -172,11 +173,12 @@ class DeepseekV4DSparkModel(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         attn: type[nn.Module] | None = None,
+        rope: tuple[RopeDataProxy, RopeDataProxy] | None = None,
     ) -> torch.Tensor:
         assert attn is not None
         kv = attn.kv_norm(attn.wkv(hidden_states))
         k_nope, k_pe = kv.split([attn.nope_head_dim, attn.rope_head_dim], dim=-1)
-        k_pe = _apply_dsv4_rope(attn.rotary_emb, positions, k_pe.unsqueeze(1)).squeeze(1)
+        k_pe = _apply_dsv4_rope(attn.rotary_emb, positions, k_pe.unsqueeze(1), rope=rope).squeeze(1)
         return torch.cat([k_nope, k_pe], dim=-1).view(-1, 1, attn.head_dim).contiguous()
 
     def _store_standard_swa_kv(
@@ -208,14 +210,18 @@ class DeepseekV4DSparkModel(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: list[torch.Tensor | None] | None = None,
     ) -> None:
-        if context_states.numel() == 0 or context_slot_mapping is None:
+        if context_states.numel() == 0 or context_slot_mapping is None or context_positions.numel() == 0:
             return
+        # All layers consume the same positions. Query the union of their
+        # configs once, using call-local tensors rather than runtime buffers.
+        rope = get_cos_and_sin_dsa(
+            context_positions,
+            layer_names=[layer.self_attn.rotary_emb.layername for layer in self.layers.values()],
+        )
         for layer_idx, layer in enumerate(self.layers.values()):
             layer_context_slot_mapping = None if context_slot_mapping is None else context_slot_mapping[layer_idx]
-            if context_positions.numel() == 0:
-                return
             attn = layer.self_attn
-            shared_kv = self._project_shared_kv(context_states, context_positions, attn)
+            shared_kv = self._project_shared_kv(context_states, context_positions, attn, rope=rope)
             self._store_standard_swa_kv(shared_kv, layer_context_slot_mapping, attn)
 
     def forward(

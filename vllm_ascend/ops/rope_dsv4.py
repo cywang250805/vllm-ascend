@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -84,7 +85,13 @@ def get_cos_and_sin_dsa(
     positions: torch.Tensor | dict[str, torch.Tensor],
     use_cache: bool = False,
     draft_index: int | None = None,
+    layer_names: Sequence[str] | None = None,
 ):
+    """Look up RoPE once per config required by the requested layers.
+
+    Omitting ``layer_names`` preserves the all-config lookup. Filtering is
+    local to this call; cached runtime buffers retain their existing lifetime.
+    """
     if isinstance(positions, torch.Tensor):
         pos_map = {"default": positions}
     else:
@@ -92,7 +99,16 @@ def get_cos_and_sin_dsa(
 
     batch_result: dict[Any, Any] = {}
 
-    for config_key, registered_groups in _ROPE_STATE.registry_summary.items():
+    config_groups = _ROPE_STATE.registry_summary
+    if layer_names is not None:
+        config_groups = {}
+        for layer_name in layer_names:
+            if layer_name not in _ROPE_STATE.layer_info:
+                raise KeyError(f"Layer {layer_name} not registered.")
+            config_key, required_groups = _ROPE_STATE.layer_info[layer_name]
+            config_groups.setdefault(config_key, set()).update(required_groups)
+
+    for config_key, registered_groups in config_groups.items():
         if config_key not in _ROPE_STATE.full_rope_cache:
             continue
         full_rope_cos, full_rope_sin = _ROPE_STATE.full_rope_cache[config_key]
